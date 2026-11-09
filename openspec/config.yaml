@@ -1,0 +1,102 @@
+schema: spec-driven
+
+context: |
+  Language: 简体中文
+  All artifacts must be written in 简体中文.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: topps-auto-bot, an independent Topps.com website automation tool.
+  Phase 0 first reproduces the reference project's complete single-product purchase
+  sequence on Topps.com, then evaluates it before optimizing for limited-stock releases.
+  Ordinary in-stock direct-purchase products may validate the baseline; no draws or auctions.
+  pythonicshariful/purchase-atomation-topps.com was reviewed as a functional reference,
+  not selected as a source dependency. Do not import, copy or line-by-line translate
+  its code, comments, documentation or assets. Implement from these requirements,
+  official dependency/provider documentation, public page evidence and controlled validation.
+  Use Python, Tkinter/ttk, Selenium with undetected-chromedriver (UC), and visible Chrome.
+  Keep the reference AutomationControlled option and a dedicated persistent profile.
+  Deliver an installable tool that users can test after manual login and card/address setup.
+  Developer proof of live login, checkout or a real payment is not a release/startup/archive gate.
+  Remove global verified=False or live-validation-complete blockers; use concrete runtime
+  page/source/field checks and actionable errors. Standard Selenium is diagnostic only.
+  Match detected Chrome versions dynamically, never hard-code 146 or 156.
+  UC patching belongs in staged-driver validation, not hidden downloads/mutations at run time.
+  Sandbox stays enabled by default (override UC defaults); no-sandbox is an explicit
+  diagnostic compatibility option, not a presumed fix for Cloudflare or a success claim.
+  Windows is the first release target.
+  Do not import the outer repository's Nuxt/ERP stack or add mini-program, Android,
+  other shopping platforms, TypeScript, PySide6 or a general plugin system.
+  Save reusable presets, but execute exactly one explicitly selected product/variant
+  and its full quantity per run. The latest decision replaces multi-product checkout.
+  Manual login in the dedicated browser is the first-release default. Reuse a current
+  authenticated session; otherwise prompt the user to log in. Stored login email/password
+  and automatic login are optional compatibility features, not prerequisites or acceptance gates.
+  Detect observable login state after the user completes login; do not infer it from a delay.
+  Show available account identity, but never require preconfigured-email matching to permit
+  manual testing. Keep the same session; no mailbox reading or automatic CAPTCHA solving.
+  RUN_READY means valid environment, purchase data, selected target, authenticated session,
+  empty cart and no unresolved prior action. Do not require user-prepared checkout pages.
+  Provide direct-link or keyword entry, quantity, Start/Stop and logs. Users select
+  exactly one search result; reusable presets are optional shortcuts, not extra mandatory steps.
+  Follow product page -> exact variant/quantity/price -> add-to-cart with result checks
+  -> cart -> official checkout -> address/card -> single payment -> real result.
+  Initial cart must be empty; leave existing contents to the user. Never auto-clear,
+  top up or remove cart lines, export daily-browser cookies or replay internal APIs.
+  Remove the whole-order 60-second/1-600-second deadline. Observe the selected product
+  until available, user stop or a definite error. Keep bounded step and manual waits.
+  Use reference pacing: sold out about 15 seconds, temporary unavailable/retry about
+  10 seconds; respect longer official waits, do not overlap, and make waits cancellable.
+  Retry an add only when proven not dispatched, or explicitly rejected temporarily
+  with no side effects, empty cart and no in-flight action. Journal each attempt.
+  Unknown/partial/successful adds must not be repeated; payment is attempted at most once.
+  JS fallback is permitted for verified non-purchase controls/fields. An uncertain
+  native add/payment click is never followed blindly by a JavaScript click.
+  Legacy schedule/window fields are compatibility data only; never clear old pending records.
+  Scheduled launch, pre-prepared cart/checkout acceleration, API ordering and the old
+  500ms performance target are deferred until baseline evaluation and a later spec update.
+  Keep exact quantity, USD unit-price and tax/shipping-inclusive order ceilings.
+  Stop on mismatching/unverifiable cart results, target mismatch or price violation.
+  Use only the website's uniquely selected default shipping service. Freeze its
+  identity and final USD shipping charge after checkout details are complete;
+  stop before payment if either changes or cannot be confirmed. Never silently
+  select an alternative service or reset that snapshot within the same task.
+  Credit-card auto-payment is required. Implement actual frame switching for separate card
+  iframes, per-frame runtime origin checks, input/readback and return to default_content;
+  parent-page fake card inputs cannot stand in for this acceptance test. Personal verification
+  stays with the user. Ship usable, maintainable page/provider rules, not only test selectors.
+  Domain/source checks remain local runtime controls; no prior real transaction is required.
+  An unclear payment result must never trigger an automatic resubmission.
+  Card details and any retained optional login data stay in local configuration.
+  Do not silently replace this with memory-only or mandatory keychain storage.
+  Real configuration, browser profiles and sensitive diagnostics must stay out of
+  Git, distributable packages and unrelated network services.
+  Provide a usable Windows installation flow, automatic compatible driver download,
+  cancel-to-manual selection, and local settings editing in the desktop UI.
+  Both downloaded and manually selected drivers must go through private staging,
+  UC preparation and full validation with that same copy, then atomic activation.
+  Staged files are not enabled drivers; no-sandbox differences must be explicit.
+  Provide a current-version display and user-initiated update check against a fixed publisher
+  HTTPS source, with release notes and a trusted download page/link opened in the browser.
+  Users run the new installer over the old version; never silently install or overwrite a
+  running purchase. Preserve settings, profile, drivers and unresolved records; handle failed
+  upgrades and incompatible config versions without destroying data or resuming a purchase.
+  Acceptance is implementation + representative controlled tests + Windows install/upgrade
+  validation. Real-account/live-payment trials are optional user evidence, not completion gates.
+  README.md contains only the requested disclaimer. Usage instructions belong in docs/.
+  Keep shared plans in openspec/ and support the generated Codex and Kimi Code skills.
+
+rules:
+  proposal:
+    - Separate confirmed scope, reference-project observations and live-site validation inputs.
+    - Keep phase 0 limited to Topps.com and Windows delivery.
+  design:
+    - Keep UI, local configuration and browser execution separate with minimal modules.
+    - Define the complete product-to-order baseline, its measured outcome and later optimization boundary.
+    - Specify cancellation, money validation, local-secret handling and payment recovery.
+    - State which choices are design baselines and which require real-site verification.
+  specs:
+    - Use concrete SHALL or MUST requirements and WHEN/THEN scenarios.
+    - Cover empty-cart preconditions, exact variant/quantity, add-to-cart results, session continuity, availability observation and proven-safe add retries.
+    - Cover success, mismatch, cancellation and uncertain-payment behavior.
+  tasks:
+    - Map implementation and meaningful verification tasks to the declared capabilities.
+    - Require implementation and controlled/Windows evidence; keep optional live trials outside mandatory completion tasks.

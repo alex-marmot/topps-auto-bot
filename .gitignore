@@ -1,0 +1,48 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build output (keep PyInstaller .spec build definitions tracked)
+/build/
+/dist/
+/installer-output/
+
+# Real local configuration and its temporary/backup files
+/config.json
+/config.json.*
+/config.local.json
+/config.local.json.*
+/secrets.json
+.env
+.env.*
+!.env.example
+!/config.example.json
+.agents
+.kimi-code
+
+# Local sessions, downloaded binaries, logs and diagnostic artifacts
+/.playwright-mcp/
+/chrome_profile/
+/browser-profile/
+/user-data/
+/drivers/
+/driver-staging/
+/logs/
+/screenshots/
+/artifacts/
+/run-state.json
+/run-state.json.*
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db

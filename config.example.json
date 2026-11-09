@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "presets": [],
+  "selected_preset_id": null,
+  "order_limit_usd": "0.00",
+  "login": {
+    "email": "",
+    "password": ""
+  },
+  "customer": {
+    "full_name": "",
+    "email": "",
+    "phone": "",
+    "address_line1": "",
+    "address_line2": "",
+    "city": "",
+    "region": "",
+    "postal_code": "",
+    "country": "US"
+  },
+  "card": {
+    "number": "",
+    "expiry_month": 0,
+    "expiry_year": 0,
+    "cvv": "",
+    "holder_name": ""
+  },
+  "driver": {
+    "mode": "automatic",
+    "path": null,
+    "version": null,
+    "platform": null,
+    "no_sandbox": false
+  },
+  "schedule": {
+    "mode": "immediate",
+    "scheduled_start_utc": null,
+    "window_seconds": 60
+  }
+}

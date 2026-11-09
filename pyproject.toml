@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topps-auto-bot"
+version = "0.1.0"
+description = "Independent Topps.com limited-stock direct-purchase desktop assistant"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "selenium==4.52.0",
+]
+
+[project.scripts]
+topps-auto-bot = "topps_auto_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]

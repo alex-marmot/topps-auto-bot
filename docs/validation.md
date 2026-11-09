@@ -1,0 +1,155 @@
+# 验证记录
+
+本文件区分“代码已实现”“本地自动测试通过”“macOS 开发验证”“Windows 验收”和“真实官网/付款验证”。未列出的项目不能视为已完成。
+
+## 环境
+
+- 日期：2026-11-06
+- 开发机：macOS 14（arm64）
+- Python：CPython 3.14.0（uv 管理的独立发行版）
+- Tk：8.6
+- Selenium：4.52.0
+- undetected-chromedriver：3.5.5
+- pytest：8.4.2
+- Chrome：156.0.8078.80
+- ChromeDriver：156.0.8078.80（Chrome for Testing 官方下载，mac-arm64）
+- 本机 Homebrew Python 3.14.7 缺少 `_tkinter`，因此开发 UI 使用 uv Python 3.14.0；这不改变 Windows 仍需单独验收的结论。
+
+## 自动测试
+
+命令与结果：
+
+```text
+.venv/bin/python -m pytest -q
+209 passed（其中包含旧预备页路径的保留测试；新完整流程、登录、UC 本地流程和连续等待/加购重试测试见下节）
+```
+
+覆盖重点：
+
+- 配置缺失/损坏/未知版本、受控迁移、原子保存失败、旧配置保留、模板不覆盖。
+- 金额 Decimal/两位小数、数量正整数、重复预设、单目标、USD 校验；旧窗口字段无效/缺失不阻止新任务。
+- 日志/错误/诊断脱敏、`run-state.json` 不含卡资料/地址/令牌、损坏提交记录阻断。
+- 驱动元数据匹配、无镜像兜底、下载取消/无总长度/路径穿越、手动副本、平台/版本/空白浏览器验证、启用失败保留旧选择。
+- 无整单截止：持续售罄超过旧 600 秒仍等待、连续读取异常 3 次停止、普通步骤/加购 30 秒、人工和付款结果 10 分钟、停止竞态、付款提交至多一次。
+- 加购：逐次尝试序号和历史记录、可证未发出/明确暂拒无副作用后重试、点击异常/单次空车不重试、部分数量/未知阻断、付款仍单次。
+- 登录与配置：登录邮箱/密码往返、遮蔽、v1→v2 受控迁移、旧配置保留、登录账号与收货邮箱独立、验证码不持久化、凭据脱敏、驱动检查不读取登录资料、未可信登录来源拒绝。
+- 自动登录：有效会话复用、无会话自动登录成功、自动失败后人工完成、验证码/额外认证转人工、错误账号转人工且不重复提交凭据、取消和等待超时；登录准备完成前加购/付款次数为零。
+- 新完整流程：空车检查、商品页规格/数量设置、持续售罄等待、安全加购重试、购物车精确核对、结算、填表、配送快照、一次付款提交和结果分类；加购结果不明、部分数量、外部改车、价格超限和未决阻断。
+- 旧预备页路径：保留的购物车/结算页测试仍可运行，但只作为旧路径证据，不计入新完整流程验收。
+
+### 本地受控登录与完整流程证据
+
+本地受控登录页面使用合成账号，覆盖：
+
+- 已有配置账号会话：复用，不提交登录表单。
+- 无会话：自动填写并提交一次，成功后进入空车检查。
+- 自动登录失败：进入同一浏览器人工等待；人工完成后重新核实账号，再走完整流程。
+- 验证码/额外认证：不重复提交凭据，转人工完成。
+- 取消和 10 分钟等待上限：购买窗口不开启，加购与付款动作均为 0 次。
+
+登录准备方式、起止和耗时记录在 `TaskOutcome.login_preparation` 及 `login_prepare_*` 性能样本中；登录耗时不计入购买窗口。一次本地自动登录流程记录为：`AUTO` 登录准备约 0.391 s，随后空车检查、商品页、加购、结算、提交和结果核对合计约 2.74 s（同一台 Mac 的受控页面，非官网）。真实 Topps 登录表单、身份服务来源、成功标志和账号匹配仍需现场验证。
+
+从空购物车和目标商品页开始，使用受控本地页面完成：
+
+```text
+PREPARING → RUN_READY → OPENING_PRODUCT → ADDING_TO_CART → VERIFYING_CART
+→ CHECKING_OUT → REVALIDATING → SUBMITTING → AWAITING_VERIFICATION → SUCCEEDED
+```
+
+一次正常流程的阶段间隔示例（同一台 Mac，非官网）：
+
+| 阶段 | 距上一阶段 |
+| --- | --- |
+| PREPARING → AUTO_LOGIN | 0.138 s |
+| AUTO_LOGIN → 登录后 PREPARING | 0.253 s |
+| 登录核实 → RUN_READY | 0.082 s |
+| RUN_READY → ADDING_TO_CART | 1.037 s |
+| ADDING_TO_CART → VERIFYING_CART | 0.133 s |
+| VERIFYING_CART → CHECKING_OUT | 0.268 s |
+| CHECKING_OUT → REVALIDATING | 0.366 s |
+| REVALIDATING → SUBMITTING | 0.330 s |
+| SUBMITTING → AWAITING_VERIFICATION | 0.051 s |
+| AWAITING_VERIFICATION → SUCCEEDED | 0.080 s |
+
+登录准备（AUTO）约 0.391 s；登录完成后的空车、商品页、加购、结算、提交和结果核对合计约 2.74 s。加购次数 1，购买提交次数 1，购物车实际只有目标规格和完整数量。该数据是本地受控页面证据，不是官网耗时或抢购成功率，也不把登录耗时计入购买窗口。
+
+### 旧两条预备路径性能（仅历史证据）
+
+旧实现的 30 次两路径试验和 P95≤500ms 数据仍保留在旧测试中，但**不适用于新基线**，不作为本次完整流程完成门槛，也不再是产品承诺。
+
+## UC 启动与驱动验证（macOS）
+
+- 已将 `undetected-chromedriver==3.5.5` 加入锁定依赖，并提供 UC 启动参数、显式 `no_sandbox=False` 处理及 UC 预处理器接口。
+- UC 处理会修改 ChromeDriver 的 ad-hoc 签名；macOS 随后会以状态 `-9` 终止未重新签名的驱动。实现已对同一暂存副本执行 `codesign --force --sign -` 重新签名并验证签名。
+- 使用复制出的 ChromeDriver 156.0.8078.80 和 Chrome 156.0.8078.80 实测：临时 UC 空白浏览器启动成功，最终参数不含 `--no-sandbox`；本地 UC 全流程（登录/空车/商品/加购/结算/付款）通过 1 个集成测试。普通 Selenium 诊断仍单独保留。
+- 这只能证明 macOS 受控页面和 UC 启动链路；Windows x64、真实官网和真实付款仍需单独验收。
+
+### 2026-11-09 UC 只读页面访问
+
+使用重新签名后的 UC 专用临时 profile，未登录、未点击加购/付款：
+
+- `https://www.topps.com/`：正常加载，标题为 Topps 官方商店，无 403/challenge 标记。
+- 用户提供的 Wembanyama 商品页：正常加载；商品页存在 `button[data-testid="product-add-to-cart"]`，但 `data-sold-out="true"`、按钮不可用。
+- 首页的在售 Tom Brady Topps NOW 商品页：同一加购按钮存在且可用；未点击。
+- `https://www.topps.com/checkout/cart`：正常加载并显示购物车为空；`https://www.topps.com/cart` 返回 404。
+- `https://www.topps.com/search?q=...`：返回 404；首页搜索表单 action 为首页 `GET q`，需要走站内搜索交互。
+- 登录入口 `https://www.topps.com/customer/account/login?next=%2F` 会跳转到 `https://id.fanatics.com/oauth2/auth?...`，先显示 Fanatics ONE 邮箱输入页，再经过 Shopify/Fanatics 登录；尚未填写账号或验证码。
+- 以上只证明公开页面/登录入口可达和部分选择器存在，不证明加购、购物车、结算或付款流程可用；未登录、未加购，不能据此报告购买成功。
+
+## 驱动真实验证（macOS）
+
+- 从 Chrome for Testing 官方元数据查询到与 Chrome 156.0.8078.80 匹配的 ChromeDriver 156.0.8078.80。
+- 自动下载、私有暂存、平台/版本检查、独立空白浏览器启动关闭验证通过。
+- 验证过程未使用真实账户、付款配置或购买页面，未传入 `--no-sandbox`。
+- 手动导入路径、取消竞态、启用失败保留旧选择由自动测试覆盖。
+
+## 本地打包冒烟
+
+- PyInstaller 6.17.0 `onedir` 定义在 macOS 上可构建，产出的可执行文件能显示 `--help`，包内仅包含 `config.example.json`，未包含真实配置/会话/日志/驱动。
+- 该结果只说明收集定义和入口可用，**不是 Windows 安装验收**；Windows 构建、无 Python 环境启动、升级/卸载仍未执行。
+
+## OpenSpec 与仓库卫生
+
+```text
+openspec validate phase-0-topps-website-bot --strict --no-interactive
+→ Change 'phase-0-topps-website-bot' is valid
+
+git diff --check
+→ 无输出
+
+scripts/check_release_hygiene.py
+→ 忽略规则、跟踪清单和现有构建目录未发现真实用户数据
+```
+
+`git check-ignore` 已确认 `config.json`、`run-state.json`、`browser-profile/`、`drivers/`、`driver-staging/`、`logs/`、`screenshots/` 均被忽略；`config.example.json` 不被忽略。`git ls-files` 当前为空（仓库尚未提交）。
+
+## 第 0 组目标尝试记录（2026-11-06，2026-11-09 复核）
+
+用户提供了一个测试入口：
+
+- `https://www.topps.com/products/victor-wembanyama-2026-27-nba-topps-now-r-card-62`
+
+只读访问结果：
+
+- Playwright 浏览器：HTTP 403，标题 `Attention Required! | Cloudflare`。
+- 普通 HTTPS 请求：HTTP 403，最终 URL 不变。
+- 工具使用的可见 Chrome 专用临时会话：仍显示 `Sorry, you have been blocked`，Cloudflare Ray ID 已记录在本地执行输出，未登录、未加购、未提交订单或付款。
+- 2026-11-09 再次用普通 HTTPS 请求复核，仍返回 HTTP 403；未绕过限制，也未使用真实账号。
+- 因此无法确认该商品页的精确规格、库存/发售机制、商品页规格/数量控件、加购结果、结算入口或按钮语义，也无法确认默认配送。没有尝试绕过 Cloudflare 或使用内部接口。
+- URL 路径包含 `topps-now` 字样，但未据此断言它属于限量直购；在页面可核实前不能作为第 0 阶段验收样本。
+
+## 尚未完成或不能声称完成
+
+- **第 0 组真实目标验证**：用户提供了一个测试入口，但当前网络环境下官网对 Playwright、普通请求和可见 Chrome 均返回 Cloudflare 403（见上节）。未完成登录、商品页规格/数量控件、自动加购、购物车→结算或按钮语义核实。`DEFAULT_TOPPs_PROFILE.verified` 仍为 `False`，UI 会阻止自动推进；这不是可用现网购买的证明。
+- **Windows x64 验收**：未在无 Python 的普通用户 Windows 环境安装、启动、升级、卸载或验证驱动自动/手动流程。`docs/installation.md` 的 Windows 部分是构建说明和预期流程，不是已完成验收。
+- **真实官网自动适配**：未验证 UC 实站访问、真实登录表单、官方身份服务来源、登录成功/账号匹配标志，也未验证真实购物车/结算选择器、排队/限流、默认配送、支付 iframe 和最终按钮语义。本地 UC 只访问受控页面。
+- **真实抢购与付款**：未执行任何真实购买提交、付款授权、本人验证或订单核对；没有官网成功率或真实耗时结论。
+- **代码签名**：未配置证书；未来 Windows 安装包应明确记录为未签名。
+
+## 交付边界
+
+已实现并通过本地测试：配置 v2 登录资料、自动登录/人工接管、UI 直链/临时目标、UC 启动代码与沙箱参数、驱动准备状态机、可信来源检查、空车检查、商品页规格/数量设置、持续库存等待、逐次加购记录与可证失败重试、普通控件 JS 兜底、购物车精确核对、结算/填表、配送快照、步骤超时/停止、加购与付款双未决恢复、结果分类。
+
+仅本地受控页面验证：普通 Selenium 诊断下的完整流程、1 个 UC 本地全流程、自动登录/人工接管、连续等待/重试，以及保留的旧预备页路径测试。
+
+未验证：真实 Topps 登录表单和身份来源、真实页面行为、真实加购/结算/支付、Windows 安装、真实付款。
