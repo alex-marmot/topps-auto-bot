@@ -220,7 +220,7 @@ def representative_browser(chromedriver_path, chrome_path, tmp_path, storefront)
     adapter = open_live_session(
         chrome_path=str(chrome_path), driver_path=str(chromedriver_path),
         profile_dir=tmp_path / "isolated-profile", policy=policy, profile=profile,
-        headless=True, use_uc=False, page_load_timeout=5.0,
+        headless=True, use_uc=False,
     )
     try:
         yield adapter, policy
@@ -279,10 +279,13 @@ def test_actual_frames_from_empty_cart_to_single_payment(representative_browser,
     ("redirect", "实际来源不可信"),
     ("replace-checkout", "结算页面已变化"),
 ])
-def test_invalid_frames_never_submit(representative_browser, storefront, tmp_path, mode, reason):
+def test_invalid_frames_never_submit(representative_browser, storefront, tmp_path, monkeypatch, mode, reason):
     adapter, policy = representative_browser
     storefront.mode = mode
     adapter.navigate(storefront.base + "/")
+    if mode in {"missing-frame", "missing-field"}:
+        # Shorten the fill wait without changing the WebDriver navigation or HTTP timeout.
+        monkeypatch.setattr(adapter, "_page_load_timeout", 5.0)
     runner, store = run_from_product(adapter, policy, storefront, tmp_path)
     outcome = runner.run()
     assert outcome.phase is TaskPhase.FAILED, outcome.message
