@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import queue
-import re
 import threading
 import time
 import uuid
@@ -29,6 +28,7 @@ from .models import (
     ReadStatus,
     Readiness,
     ScheduleMode,
+    SINGLE_PRODUCT_VARIANT,
     ScheduleSettings,
     ShippingSnapshot,
     SubmissionState,
@@ -39,6 +39,7 @@ from .models import (
     format_beijing_datetime,
     format_usd,
     normalize_text,
+    utc_now_iso,
 )
 from .purchase import (
     SubmissionBlocked,
@@ -530,6 +531,8 @@ class PurchaseRunner:
                     )
                 if entered.ok:
                     entered_checkout = True
+                    deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
+                    step = "结算页面和报价"
                     self._emit(TaskPhase.CHECKING_OUT, "已沿官方入口进入结算，继续核对订单和表单")
                     continue
                 self._emit_once(last_reason, TaskPhase.CHECKING_OUT, "官方结算入口尚未开放，窗口内继续观察")
@@ -867,6 +870,7 @@ class FullFlowRunner:
         self.redactor = Redactor.from_credentials(snapshot.customer, snapshot.card, snapshot.login)
         self._last_refresh_monotonic: float | None = None
         self._login_preparation: LoginPreparation | None = None
+        self._account_identity: str | None = None
 
     def _emit(self, phase: TaskPhase, message: str, details: dict | None = None) -> None:
         event = TaskEvent(
@@ -948,7 +952,7 @@ class FullFlowRunner:
                 login_preparation=self._login_preparation,
             )
         except Exception as exc:  # noqa: BLE001 - never let the worker die silently
-            message = f"任务异常停止：{exc}"
+            message = f"任务异常停止（{type(exc).__name__}），请核对当前浏览器步骤与未决记录"
             self._emit(TaskPhase.FAILED, message)
             return TaskOutcome(
                 phase=TaskPhase.FAILED,
@@ -1002,7 +1006,7 @@ class FullFlowRunner:
         now = self.clock.now()
         self._emit(
             TaskPhase.RUN_READY,
-            "环境、配置账号登录与空购物车检查通过",
+            "环境、登录与空购物车检查通过",
             {"empty_cart": True, "login_mode": login_mode},
         )
         return ActiveWindow(
@@ -1030,82 +1034,49 @@ class FullFlowRunner:
         )
 
     def _identity_matches(self, identity: str | None) -> bool:
-        configured = normalize_text(self.snapshot.login.email)
         actual = normalize_text(identity or "")
-        if not configured or not actual:
+        if self._account_identity and actual and actual != self._account_identity:
             return False
-        if actual == configured:
-            return True
-        email_match = re.search(r"[^@\s]+@[^@\s]+\.[^@\s]+", actual)
-        return bool(email_match and normalize_text(email_match.group(0)) == configured)
+        if actual:
+            self._account_identity = actual
+        return True
+
+    @staticmethod
+    def _account_summary(identity: str | None) -> str | None:
+        if not identity:
+            return None
+        if "@" in identity and identity[0].isalnum():
+            return f"{identity[0]}***"
+        return "已识别账号"
 
     def _ensure_login_verified(self, preparation_deadline: datetime) -> str:
-        if not self.snapshot.login.email.strip():
-            raise _StopTask(TaskPhase.FAILED, "未配置登录账号，不能开始自动登录")
-        navigation = self.session.navigate_to_cart()
-        if navigation.uncertain:
-            raise _StopTask(TaskPhase.STOPPED, "打开购物车以检查登录状态的结果不明，未继续自动流程")
-        if not navigation.ok:
-            raise _StopTask(TaskPhase.UNSUPPORTED, navigation.error or "无法打开官方购物车")
-        auto_attempted = False
-        manual_reason: str | None = None
-        while True:
-            self._check_stop()
-            if self.clock.now() >= preparation_deadline:
-                raise _StopTask(TaskPhase.MISSED, "登录准备达到时间上限，未开始购买窗口")
-            state = self.session.read_login_state()
-            if state.status is LoginStatus.LOGGED_IN:
-                if self._identity_matches(state.account_identity):
-                    self._emit(
-                        TaskPhase.PREPARING,
-                        "已核实配置账号的登录状态",
-                        {"login_mode": "REUSED"},
-                    )
-                    return "REUSED"
-                manual_reason = "当前登录账号与配置不一致，或无法核实账号身份"
-                self._emit_once(manual_reason, TaskPhase.AWAITING_MANUAL_LOGIN, manual_reason + "；请在专用 Chrome 中切换或确认账号")
-                if self._wait_manual_login(preparation_deadline):
-                    return "MANUAL"
-            if state.status in (LoginStatus.BLOCKED, LoginStatus.SESSION_LOST):
-                raise _StopTask(TaskPhase.UNSUPPORTED, "登录页面访问受限或会话失效，不能自动登录")
-            if state.status is LoginStatus.CHALLENGE:
-                manual_reason = state.error or "官网要求验证码、人机或额外认证"
-                self._emit_once(manual_reason, TaskPhase.AWAITING_MANUAL_LOGIN, manual_reason + "；请在专用 Chrome 中人工完成")
-                if self._wait_manual_login(preparation_deadline):
-                    return "MANUAL"
-            if state.status in (LoginStatus.ERROR, LoginStatus.UNRECOGNIZED):
-                self._emit_once("登录状态暂不可核实", TaskPhase.PREPARING, "登录状态暂不可核实，有限等待页面可确认")
-                self._sleep()
-                continue
-            if auto_attempted:
-                manual_reason = state.error or manual_reason or "自动登录未成功"
-                self._emit_once(manual_reason, TaskPhase.AWAITING_MANUAL_LOGIN, manual_reason + "；请在专用 Chrome 中人工完成")
-                if self._wait_manual_login(preparation_deadline):
-                    return "MANUAL"
-            auto_attempted = True
-            self._emit(
-                TaskPhase.AUTO_LOGIN,
-                "未发现配置账号的有效会话，使用本地资料尝试一轮官方表单自动登录",
-                {"login_mode": "AUTO"},
-            )
+        state = self.session.read_login_state()
+        if state.status is LoginStatus.LOGGED_IN:
+            self._identity_matches(state.account_identity)
+            self._emit(TaskPhase.PREPARING, "已核实专用浏览器的登录状态",
+                       {"login_mode": "REUSED", "account_summary": self._account_summary(state.account_identity)})
+            return "REUSED"
+        if state.status in (LoginStatus.BLOCKED, LoginStatus.SESSION_LOST):
+            raise _StopTask(TaskPhase.UNSUPPORTED, state.error or "登录页面访问受限或会话失效")
+        self._check_stop()
+        if (
+            self.snapshot.auto_login and self.snapshot.login.email.strip()
+            and state.status is LoginStatus.NOT_LOGGED_IN
+        ):
+            self._emit(TaskPhase.AUTO_LOGIN, "尝试一次官方表单自动登录", {"login_mode": "AUTO"})
             result = self.session.login_with_credentials(self.snapshot.login)
             if result.attempted:
                 state = self._poll_auto_login_result(preparation_deadline)
-                if state.status is LoginStatus.LOGGED_IN and self._identity_matches(state.account_identity):
-                    self._emit(
-                        TaskPhase.PREPARING,
-                        "自动登录成功并已核实配置账号",
-                        {"login_mode": "AUTO"},
-                    )
+                if state.status is LoginStatus.LOGGED_IN:
+                    self._emit(TaskPhase.PREPARING, "已核实自动登录状态", {"login_mode": "AUTO"})
                     return "AUTO"
-            manual_reason = result.error or (state.error if state is not None else None) or "自动登录未成功"
-            self._emit(
-                TaskPhase.AWAITING_MANUAL_LOGIN,
-                manual_reason + "；请在同一专用 Chrome 中人工完成登录，程序不会重复提交凭据或发码",
-                {"login_mode": "MANUAL"},
-            )
-            if self._wait_manual_login(preparation_deadline):
-                return "MANUAL"
+        self._emit(
+            TaskPhase.AWAITING_MANUAL_LOGIN,
+            "请在同一专用 Chrome 中登录并完成官网挑战；程序会检查实际登录状态",
+            {"login_mode": "MANUAL"},
+        )
+        self._wait_manual_login(preparation_deadline)
+        return "MANUAL"
 
     def _poll_auto_login_result(self, preparation_deadline: datetime) -> LoginRead:
         deadline = min(
@@ -1125,7 +1096,7 @@ class FullFlowRunner:
             self._sleep()
         return state
 
-    def _wait_manual_login(self, preparation_deadline: datetime) -> bool:
+    def _wait_manual_login(self, preparation_deadline: datetime) -> None:
         deadline = min(
             preparation_deadline,
             self.clock.now() + timedelta(seconds=self.manual_login_timeout_seconds),
@@ -1137,10 +1108,10 @@ class FullFlowRunner:
             if state.status is LoginStatus.LOGGED_IN and self._identity_matches(state.account_identity):
                 self._emit(
                     TaskPhase.PREPARING,
-                    "人工登录已完成并核实配置账号",
-                    {"login_mode": "MANUAL"},
+                    "已核实人工登录状态",
+                    {"login_mode": "MANUAL", "account_summary": self._account_summary(state.account_identity)},
                 )
-                return True
+                return
             if state.status in (LoginStatus.BLOCKED, LoginStatus.SESSION_LOST):
                 raise _StopTask(TaskPhase.UNSUPPORTED, "人工登录页面访问受限或会话失效")
             if state.status is LoginStatus.LOGGED_IN:
@@ -1171,18 +1142,53 @@ class FullFlowRunner:
             self.clock.sleep(step)
             remaining -= step
 
-    def _wait_for_available_product(self, preset) -> ProductPageState:
+    @staticmethod
+    def _product_variant_matches(product: ProductPageState, variant: str) -> bool:
+        if not product.variants:
+            return product.single_variant and variant == SINGLE_PRODUCT_VARIANT
+        expected = normalize_text(variant)
+        return (
+            normalize_text(product.selected_variant or "") == expected
+            and any(normalize_text(option) == expected for option in product.variants)
+        )
+
+    def _wait_for_available_product(self, preset) -> bool:
+        """Return whether this visit waited, invalidating any prior empty-cart check."""
         self._emit(TaskPhase.OPENING_PRODUCT, "打开已确认的目标商品页")
         product = self.session.open_product(preset.url)
         if product.status is ReadStatus.BLOCKED:
             raise _StopTask(TaskPhase.UNSUPPORTED, product.error or "商品页访问受限")
         last_reason: str | None = None
         read_errors = 0
+        challenge_deadline = None
+        variant_set = quantity_set = False
+        waited = False
         while True:
             self._check_stop()
             product = self.session.read_product_page()
             if product.status is ReadStatus.BLOCKED:
                 raise _StopTask(TaskPhase.UNSUPPORTED, product.error or "商品页访问受限")
+            if product.status is ReadStatus.CHALLENGE:
+                if challenge_deadline is None:
+                    challenge_deadline = self.clock.now() + timedelta(seconds=self.manual_login_timeout_seconds)
+                if self.clock.now() >= challenge_deadline:
+                    raise _StopTask(TaskPhase.STOPPED, "商品页人工验证等待超时")
+                reason = product.error or "请在专用 Chrome 中完成官网验证"
+                self._emit_once(last_reason, TaskPhase.WAITING_AVAILABILITY, reason)
+                last_reason = reason
+                waited = True
+                self._sleep_interruptible(1)
+                continue
+            if challenge_deadline is not None:
+                self._assert_session_account()
+                challenge_deadline = None
+            if product.status is ReadStatus.WAITING:
+                reason = "官网正在排队，保留当前页面并等待"
+                self._emit_once(last_reason, TaskPhase.WAITING_AVAILABILITY, reason)
+                last_reason = reason
+                waited = True
+                self._sleep_interruptible(max(TRANSIENT_RETRY_INTERVAL_SECONDS, product.retry_after_seconds or 0))
+                continue
             if product.status in (ReadStatus.ERROR, ReadStatus.UNRECOGNIZED, ReadStatus.NOT_AVAILABLE):
                 read_errors += 1
                 if read_errors >= READ_ERROR_LIMIT:
@@ -1194,6 +1200,7 @@ class FullFlowRunner:
                 )
                 last_reason = "等待商品页"
                 self._maybe_safe_product_refresh()
+                waited = True
                 self._sleep_interruptible(TRANSIENT_RETRY_INTERVAL_SECONDS)
                 continue
             read_errors = 0
@@ -1202,50 +1209,60 @@ class FullFlowRunner:
                     TaskPhase.STOPPED,
                     f"商品身份不一致：页面为 {product.title or '未知'}，预设为 {preset.title}",
                 )
-            if not product.single_variant and product.variants:
-                if normalize_text(product.selected_variant or "") != normalize_text(preset.variant):
-                    selection = self.session.select_variant(preset.variant)
-                    if not selection.ok:
-                        raise _StopTask(TaskPhase.STOPPED, "规格设置失败：" + (selection.error or "无法选择预设规格"))
-                    continue
+            if not product.add_to_cart_enabled:
+                reason = "暂不可购：加购按钮当前不可用"
+                self._emit_once(last_reason, TaskPhase.WAITING_AVAILABILITY, reason)
+                last_reason = reason
+                interval = TRANSIENT_RETRY_INTERVAL_SECONDS if product.sold_out is False else SOLD_OUT_INTERVAL_SECONDS
+                waited = True
+                self._sleep_interruptible(interval)
+                self._maybe_safe_product_refresh()
+                variant_set = quantity_set = False
+                continue
+            if not self._product_variant_matches(product, preset.variant):
+                if variant_set or not any(
+                    normalize_text(option) == normalize_text(preset.variant) for option in product.variants
+                ):
+                    raise _StopTask(TaskPhase.STOPPED, "商品规格与本次目标不一致")
+                variant_set = True
+                selection = self.session.select_variant(preset.variant)
+                if not selection.ok:
+                    raise _StopTask(TaskPhase.STOPPED, "规格设置失败：" + (selection.error or "无法选择预设规格"))
+                continue
             if product.quantity != preset.quantity:
+                if quantity_set:
+                    raise _StopTask(TaskPhase.STOPPED, "数量设置后发生变化")
+                quantity_set = True
                 quantity_result = self.session.set_quantity(preset.quantity)
                 if not quantity_result.ok:
                     raise _StopTask(TaskPhase.STOPPED, "数量设置失败：" + (quantity_result.error or "无法设置完整数量"))
                 continue
             product_reason = self._validate_product_price(product)
             if product_reason is not None:
-                if product_reason.startswith("暂不可购"):
-                    self._emit_once(last_reason, TaskPhase.WAITING_AVAILABILITY, product_reason)
-                    last_reason = product_reason
-                    self._maybe_safe_product_refresh()
-                    self._sleep_interruptible(SOLD_OUT_INTERVAL_SECONDS)
-                    continue
                 raise _StopTask(TaskPhase.STOPPED, product_reason)
-            return product
+            return waited
 
     def _execute_full_flow(self, window: ActiveWindow) -> TaskOutcome:
         preset = self._target()
         self._assert_session_account()
-        product = self._wait_for_available_product(preset)
-        empty_checked = False
         attempt_seq = 1
         while True:
-            self._check_stop()
-            self._assert_session_account()
-            if not empty_checked:
+            self._wait_for_available_product(preset)
+            for _ in range(READ_ERROR_LIMIT):
+                self._check_stop()
+                self._assert_session_account()
                 empty_result = self._verify_empty_cart_again()
                 if empty_result is not None:
                     raise _StopTask(TaskPhase.STOPPED, empty_result)
-                empty_checked = True
-                product = self._wait_for_available_product(preset)
-                continue
+                if not self._wait_for_available_product(preset):
+                    break
+            else:
+                raise _StopTask(TaskPhase.STOPPED, "多次核对期间商品可购状态发生变化，无法确认加购前置条件")
             try:
-                successful = self._attempt_add(product, attempt_seq)
+                successful = self._attempt_add(attempt_seq)
             except _RetryAdd as retry:
                 self._emit_once(None, TaskPhase.WAITING_AVAILABILITY, retry.message)
                 self._sleep_interruptible(retry.interval)
-                empty_checked = False
                 continue
             if successful:
                 self._emit(TaskPhase.CHECKING_OUT, "加购完整成功，重新核对后立即进入官方结算")
@@ -1257,7 +1274,6 @@ class FullFlowRunner:
                 {"attempt": attempt_seq - 1},
             )
             self._sleep_interruptible(TRANSIENT_RETRY_INTERVAL_SECONDS)
-            empty_checked = False
 
     def _validate_product_price(self, product: ProductPageState) -> str | None:
         preset = self._target()
@@ -1305,16 +1321,15 @@ class FullFlowRunner:
         except Exception:  # noqa: BLE001
             pass
 
-    def _attempt_add(self, product: ProductPageState, attempt_seq: int) -> bool:
+    def _attempt_add(self, attempt_seq: int) -> bool:
         preset = self._target()
         fresh = self.session.read_product_page()
         if fresh.status is not ReadStatus.OK:
             raise _StopTask(TaskPhase.STOPPED, fresh.error or "加购前无法重新读取商品页")
         if not fresh.title or normalize_text(fresh.title) != normalize_text(preset.title):
             raise _StopTask(TaskPhase.STOPPED, "加购前商品身份发生变化，未点击加购")
-        if not fresh.single_variant and fresh.variants:
-            if normalize_text(fresh.selected_variant or "") != normalize_text(preset.variant):
-                raise _StopTask(TaskPhase.STOPPED, "加购前规格发生变化，未点击加购")
+        if not self._product_variant_matches(fresh, preset.variant):
+            raise _StopTask(TaskPhase.STOPPED, "加购前规格发生变化，未点击加购")
         if fresh.quantity != preset.quantity:
             raise _StopTask(TaskPhase.STOPPED, "加购前数量发生变化，未点击加购")
         price_reason = self._validate_product_price(fresh)
@@ -1354,21 +1369,25 @@ class FullFlowRunner:
             except Exception:  # noqa: BLE001 - retain blocking record if conclusion cannot be saved
                 pass
             raise _StopTask(TaskPhase.STOPPED, "收到停止请求，未触发加购")
+        verify_deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
         try:
-            result = self.session.add_to_cart()
+            result = self.session.add_to_cart(check=self._check_stop)
+        except _StopTask:
+            self._update_add(record, AddToCartState.NOT_SENT, "点击前收到停止请求")
+            raise
         except Exception as exc:  # noqa: BLE001 - unknown whether click reached site
-            record = self._update_add(record, AddToCartState.UNKNOWN, f"加购动作异常：{exc}")
+            record = self._update_add(record, AddToCartState.UNKNOWN, "加购动作异常，结果待核对")
             raise _StopTask(TaskPhase.UNKNOWN, "加购结果不明；已保留未决记录，禁止重复加购") from exc
-        if not result.attempted and not result.ok:
+        if not result.attempted and not result.ok and not result.uncertain:
             self._update_add(record, AddToCartState.NOT_SENT, result.error or "加购在点击前不可用")
             return False
         record = self._update_add(record, AddToCartState.IN_FLIGHT, "加购已触发，等待购物车核对")
         self._emit(TaskPhase.VERIFYING_CART, "加购已触发；仅核对一次结果，不补点或重发")
-        confirmed, reason, _empty = self._verify_add_result()
+        confirmed, reason, _empty = self._verify_add_result(verify_deadline)
         if confirmed:
             self._update_add(record, AddToCartState.CONFIRMED, "购物车精确匹配")
             return True
-        if getattr(result, "confirmed_no_side_effect", False) and _empty:
+        if result.confirmed_no_side_effect and not result.uncertain and _empty:
             self._update_add(record, AddToCartState.NOT_SENT, reason or "官网明确暂拒且购物车为空")
             return False
         self._update_add(record, AddToCartState.UNKNOWN, reason or "加购结果无法确认")
@@ -1390,56 +1409,57 @@ class FullFlowRunner:
         )
         return self.store.update_add_to_cart(updated, now=self.clock.now())
 
-    def _verify_add_result(self) -> tuple[bool, str | None, bool]:
+    def _verify_add_result(self, deadline: datetime) -> tuple[bool, str | None, bool]:
         preset = self._target()
-        verify_deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
-        last_reason = "等待购物车显示本次加购结果"
-        saw_empty = False
+        last_reason = "加购结果核对超过 30 秒"
+        empty = False
         failures = 0
-        while self.clock.now() < verify_deadline:
+        while self.clock.now() < deadline:
             self._check_stop()
             navigation = self.session.navigate_to_cart()
             if navigation.uncertain:
-                return False, "加购后打开购物车的结果不明", saw_empty
-            if not navigation.ok:
-                failures += 1
-                if failures >= READ_ERROR_LIMIT:
-                    return False, navigation.error or "加购后连续无法打开购物车", saw_empty
-                last_reason = navigation.error or "加购后无法打开购物车"
-                self._sleep()
-                continue
-            cart = self.session.read_cart()
-            if cart.status in (ReadStatus.SESSION_LOST, ReadStatus.BLOCKED):
-                return False, "加购后会话或访问失效", saw_empty
-            if cart.status is ReadStatus.OK:
-                content = match_single_target(cart.lines, preset, currency=cart.currency)
-                if content.ok:
-                    return True, None, saw_empty
-                last_reason = content.reason or "购物车内容不符合唯一目标"
-                return False, last_reason, saw_empty
-            if cart.status is ReadStatus.EMPTY:
-                saw_empty = True
+                return False, "加购后打开购物车的结果不明", False
+            if navigation.ok and self.clock.now() < deadline:
+                cart = self.session.read_cart()
+                self._check_stop()
+                if self.clock.now() >= deadline:
+                    return False, "加购结果核对超过 30 秒", False
+                if cart.status is ReadStatus.OK and cart.lines:
+                    content = match_single_target(cart.lines, preset, currency=cart.currency)
+                    return content.ok, content.reason, False
+                if cart.status in (ReadStatus.SESSION_LOST, ReadStatus.NOT_LOGGED_IN, ReadStatus.BLOCKED):
+                    return False, "加购后会话或访问失效", False
+                empty = cart.status is ReadStatus.EMPTY
+            else:
+                empty = False
+            if empty:
+                failures = 0
                 last_reason = "购物车仍为空，等待加购结果"
             else:
                 failures += 1
                 if failures >= READ_ERROR_LIMIT:
-                    return False, "加购后购物车连续读取异常", saw_empty
-                last_reason = "加购后购物车暂时无法读取"
+                    return False, "加购后购物车连续读取异常", False
             self._sleep()
-        return False, last_reason, saw_empty
+        return False, last_reason, empty
 
     def _checkout_and_submit(self) -> TaskOutcome:
         preset = self._target()
         entered_checkout = False
         shipping: ShippingSnapshot | None = None
         last_reason: str | None = None
-        entry_started = self.clock.now()
+        deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
+        step = "结算入口"
+        form_filled = False
+
+        def check_deadline() -> None:
+            self._check_stop()
+            if self.clock.now() >= deadline:
+                raise _StopTask(TaskPhase.STOPPED, f"{step}等待超过 30 秒，停止并保留浏览器")
         read_failures = 0
         while True:
             self._check_stop()
             self._assert_session_account()
-            if not entered_checkout and (self.clock.now() - entry_started).total_seconds() >= STEP_TIMEOUT_SECONDS:
-                raise _StopTask(TaskPhase.STOPPED, "结算入口等待超过 30 秒，停止并保留浏览器")
+            check_deadline()
             if not entered_checkout:
                 cart = self.session.read_cart()
                 if cart.status in (ReadStatus.SESSION_LOST, ReadStatus.NOT_LOGGED_IN):
@@ -1449,11 +1469,15 @@ class FullFlowRunner:
                 content = match_single_target(cart.lines, preset, currency=cart.currency)
                 if not content.ok:
                     raise _StopTask(TaskPhase.STOPPED, "购物车内容与唯一目标不一致：" + (content.reason or ""))
+                check_deadline()
                 entered = self.session.enter_checkout()
+                check_deadline()
                 if entered.uncertain:
                     raise _StopTask(TaskPhase.STOPPED, "去结算动作结果不明，未重复导航")
                 if entered.ok:
                     entered_checkout = True
+                    deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
+                    step = "结算页面和报价"
                     self._emit(TaskPhase.CHECKING_OUT, "已进入官方结算，继续填写与核对")
                     continue
                 self._emit_once(last_reason, TaskPhase.CHECKING_OUT, "官方结算入口暂未开放")
@@ -1461,6 +1485,7 @@ class FullFlowRunner:
                 self._sleep()
                 continue
             checkout = self.session.read_checkout()
+            check_deadline()
             if checkout.status in (ReadStatus.SESSION_LOST, ReadStatus.NOT_LOGGED_IN):
                 raise _StopTask(TaskPhase.STOPPED, "结算会话失效，停止并保留浏览器")
             if checkout.status is ReadStatus.BLOCKED:
@@ -1478,10 +1503,20 @@ class FullFlowRunner:
             if not content.ok:
                 raise _StopTask(TaskPhase.STOPPED, "结算订单摘要与唯一目标不一致：" + (content.reason or ""))
             if self._form_reason(checkout) is not None:
-                result = self.session.fill_checkout(self.snapshot.customer, self.snapshot.card, self.policy)
+                if form_filled:
+                    raise _StopTask(TaskPhase.STOPPED, "结算表单已变化：" + "；".join(checkout.form.errors))
+                step = "结算表单"
+                deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
+                result = self.session.fill_checkout(
+                    self.snapshot.customer, self.snapshot.card, self.policy, check=check_deadline,
+                )
+                check_deadline()
                 if not result.ok:
                     raise _StopTask(TaskPhase.FAILED, "结算资料填写失败：" + (result.error or "未知错误"))
-                checkout = self.session.read_checkout()
+                form_filled = True
+                step = "结算报价"
+                deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
+                continue
             readiness = evaluate_checkout(checkout, preset, self.snapshot.target.order_limit_usd)
             if readiness.level is not PreparedLevel.CHECKOUT_READY:
                 if self._is_transient_checkout_gap(checkout):
@@ -1503,13 +1538,15 @@ class FullFlowRunner:
                     "已固定本次默认配送快照；下一次读取将再次核对服务与 USD 运费后才付款",
                     shipping.to_dict(),
                 )
+                step = "最终购买按钮"
+                deadline = self.clock.now() + timedelta(seconds=STEP_TIMEOUT_SECONDS)
                 self._sleep(0)
                 continue
             shipping_reason = verify_shipping_snapshot(checkout, shipping)
             if shipping_reason:
                 raise _StopTask(TaskPhase.STOPPED, shipping_reason)
             if not checkout.final_submit_enabled:
-                self._emit_once(last_reason, TaskPhase.REVALIDATING, "最终购买按钮尚未开放，窗口内继续观察")
+                self._emit_once(last_reason, TaskPhase.REVALIDATING, "最终购买按钮尚未开放，继续观察")
                 last_reason = "等待最终提交"
                 self._sleep()
                 continue
@@ -1521,7 +1558,7 @@ class FullFlowRunner:
             )
             if final.level is not PreparedLevel.CHECKOUT_READY:
                 raise _StopTask(TaskPhase.STOPPED, "付款前复核未通过：" + ("；".join(final.reasons) or "无法确认"))
-            return self._submit_purchase(checkout, shipping)
+            return self._submit_purchase(checkout, shipping, check=check_deadline)
 
     def _form_reason(self, checkout: CheckoutRead) -> str | None:
         if checkout.form is None:
@@ -1543,11 +1580,12 @@ class FullFlowRunner:
         self,
         checkout: CheckoutRead,
         shipping: ShippingSnapshot,
+        *,
+        check: Callable[[], None],
     ) -> TaskOutcome:
         preset = self._target()
-        now = self.clock.now()
         self._check_stop()
-        self._assert_session_account()
+        now = self.clock.now()
         assert checkout.total_usd is not None
         record = build_submission_record(
             task_id=self.snapshot.task_id,
@@ -1555,7 +1593,7 @@ class FullFlowRunner:
             order_limit_usd=self.snapshot.target.order_limit_usd,
             prepared_level=PreparedLevel.CHECKOUT_READY,
             planned_start_utc=None,
-            deadline_utc=now + timedelta(seconds=self.result_timeout_seconds),
+            deadline_utc=None,
             shipping=shipping,
             total_usd=checkout.total_usd,
             now=now,
@@ -1568,19 +1606,31 @@ class FullFlowRunner:
         if self.cancel_event.is_set():
             self._mark_purchase_not_submitted(record, "提交记录保存后、点击前收到停止请求")
             raise _StopTask(TaskPhase.STOPPED, "收到停止请求，未触发付款")
+        dispatched_at = self.clock.now()
+        result_deadline = dispatched_at + timedelta(seconds=self.result_timeout_seconds)
         try:
-            result = self.session.submit_purchase()
+            result = self.session.submit_purchase(check=check)
+        except _StopTask:
+            self._mark_purchase_not_submitted(record, "点击前已停止或步骤期限到达")
+            raise
         except Exception as exc:  # noqa: BLE001
-            record = self._update_purchase(record, state=SubmissionState.UNKNOWN, note=f"提交动作异常：{exc}")
+            record = self._update_purchase(
+                record, state=SubmissionState.UNKNOWN, note="提交动作异常，结果待核对",
+                submitted_at_utc=utc_now_iso(dispatched_at),
+            )
             self._emit(TaskPhase.AWAITING_VERIFICATION, "付款提交结果不明，禁止重复提交；请人工核对")
-            return self._await_result(record)
+            return self._await_result(record, result_deadline)
         if not result.attempted and result.sent is False:
             self._mark_purchase_not_submitted(record, result.error or "最终按钮在点击前不可用")
             raise _StopTask(TaskPhase.NOT_SUBMITTED, result.error or "最终购买未被发出")
-        if result.error:
-            record = self._update_purchase(record, state=SubmissionState.UNKNOWN, note=result.error)
+        record = self._update_purchase(
+            record,
+            state=SubmissionState.UNKNOWN if result.error else record.state,
+            note="提交结果待核对" if result.error else record.note,
+            submitted_at_utc=utc_now_iso(dispatched_at),
+        )
         self._emit(TaskPhase.AWAITING_VERIFICATION, "购买提交已发出；仅核对结果，不再重复提交")
-        return self._await_result(record)
+        return self._await_result(record, result_deadline)
 
     def _mark_purchase_not_submitted(self, record: SubmissionRecord, note: str) -> None:
         updated = self._update_purchase(record, state=SubmissionState.NOT_SUBMITTED, note=note)
@@ -1589,23 +1639,10 @@ class FullFlowRunner:
     def _update_purchase(self, record: SubmissionRecord, **changes) -> SubmissionRecord:
         from dataclasses import replace
 
-        updated = replace(
-            record,
-            updated_at_utc=self.clock.now().astimezone(UTC).isoformat(timespec="seconds"),
-            **changes,
-        )
-        snapshot = self.store.load()
-        self.store._write(
-            add_to_cart=snapshot.add_to_cart,
-            purchase=updated,
-            flow_type="full_baseline",
-            now=self.clock.now(),
-            add_to_cart_attempts=snapshot.add_to_cart_attempts,
-        )
-        return updated
+        return self.store.update_purchase(replace(record, **changes), now=self.clock.now())
 
-    def _await_result(self, record: SubmissionRecord) -> TaskOutcome:
-        deadline = self.clock.now() + timedelta(seconds=self.result_timeout_seconds)
+    def _await_result(self, record: SubmissionRecord, deadline: datetime) -> TaskOutcome:
+        verification_notified = False
         while self.clock.now() < deadline:
             if self.cancel_event.is_set():
                 try:
@@ -1624,6 +1661,13 @@ class FullFlowRunner:
                 result = self.session.read_order_result()
             except Exception as exc:  # noqa: BLE001
                 result = OrderResult(status=OrderStatus.UNKNOWN, evidence=str(exc))
+            if self.cancel_event.is_set():
+                continue
+            if self.clock.now() >= deadline:
+                break
+            if result.status is OrderStatus.VERIFICATION and not verification_notified:
+                self._emit(TaskPhase.AWAITING_VERIFICATION, result.evidence or "请完成银行本人验证")
+                verification_notified = True
             state, note = classify_order_result(result, self._target())
             if state is SubmissionState.SUCCEEDED:
                 record = self._update_purchase(

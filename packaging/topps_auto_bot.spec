@@ -1,20 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parent
 SRC = ROOT / "src"
 EXAMPLE = ROOT / "config.example.json"
+datas = [(str(EXAMPLE), ".")]
+publisher_source = os.environ.get("TOPPS_BUILD_PUBLISHER_RESOURCE")
+if publisher_source:
+    datas.append((publisher_source, "."))
 
 a = Analysis(
     [str(ROOT / "packaging" / "entrypoint.py")],
     pathex=[str(SRC)],
     binaries=[],
-    datas=[(str(EXAMPLE), ".")],
+    datas=datas,
     hiddenimports=[
         "tkinter",
         "tkinter.ttk",
         "tkinter.filedialog",
         "tkinter.messagebox",
+        "setuptools",
+        "setuptools._distutils.version",
+        "distutils.version",
         "undetected_chromedriver",
         "undetected_chromedriver.patcher",
         "websockets",
@@ -23,7 +31,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "setuptools", "pip", "wheel", "distutils"],
+    excludes=["pytest", "pip"],
     noarchive=False,
     optimize=1,
 )

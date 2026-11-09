@@ -85,14 +85,16 @@ class DriverOperation:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     activation_allowed: bool = True
     staging_dir: Path | None = None
+    commit_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     @property
     def cancelled(self) -> bool:
         return self.cancel_event.is_set() or not self.activation_allowed
 
     def cancel(self) -> None:
-        self.activation_allowed = False
-        self.cancel_event.set()
+        with self.commit_lock:
+            self.activation_allowed = False
+            self.cancel_event.set()
 
 
 @dataclass(frozen=True)
@@ -145,7 +147,9 @@ def driver_binary_name(platform_tag: str) -> str:
     return "chromedriver.exe" if platform_tag.startswith("win") else "chromedriver"
 
 
-def _run_version(command: list[str], *, timeout: float = 15.0) -> str:
+def _run_version(
+    command: list[str], *, timeout: float = 15.0, env: dict[str, str] | None = None,
+) -> str:
     try:
         completed = subprocess.run(
             command,
@@ -153,6 +157,8 @@ def _run_version(command: list[str], *, timeout: float = 15.0) -> str:
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DriverValidationError(f"无法执行版本检查：{exc}") from exc
@@ -166,11 +172,21 @@ def _extract_version(output: str) -> str:
     return match.group(1)
 
 
-def inspect_chrome(path: Path, *, runner: Callable[..., str] = _run_version) -> ChromeInstallation:
+def _read_chrome_version(path: Path) -> str:
+    if platform.system() == "Windows":
+        return _run_version(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-Item -LiteralPath $env:TOPPS_CHROME_VERSION_FILE -ErrorAction Stop).VersionInfo.ProductVersion"],
+            env={**os.environ, "TOPPS_CHROME_VERSION_FILE": str(path.resolve())},
+        )
+    return _run_version([str(path), "--version"])
+
+
+def inspect_chrome(path: Path, *, runner: Callable[..., str] | None = None) -> ChromeInstallation:
     path = Path(path)
     if not path.is_file():
         raise DriverValidationError(f"Chrome 文件不存在：{path}")
-    version = _extract_version(runner([str(path), "--version"]))
+    version = _extract_version(runner([str(path), "--version"]) if runner else _read_chrome_version(path))
     return ChromeInstallation(
         path=path,
         version=version,
@@ -214,7 +230,7 @@ def detect_chrome(
     candidates: list[Path] | None = None,
     system: str | None = None,
     environ: Mapping[str, str] | None = None,
-    runner: Callable[..., str] = _run_version,
+    runner: Callable[..., str] | None = None,
 ) -> ChromeInstallation | None:
     for candidate in candidates if candidates is not None else chrome_candidate_paths(system=system, environ=environ):
         try:
@@ -240,11 +256,33 @@ def _check_https_source(url: str, *, allowed_host: str, path_prefix: str | None 
         raise DriverMetadataError("来源路径不在官方下载目录内")
 
 
+class _OfficialRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, host: str, prefix: str) -> None:
+        self.host = host
+        self.prefix = prefix
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_https_source(newurl, allowed_host=self.host, path_prefix=self.prefix)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _metadata_open(url, *, timeout):
+    return urllib.request.build_opener(
+        _OfficialRedirects(CURRENT_CHROME_PLATFORM_HOST, "/chrome-for-testing/")
+    ).open(url, timeout=timeout)
+
+
+def _driver_open(url, *, timeout):
+    return urllib.request.build_opener(
+        _OfficialRedirects(DOWNLOAD_HOST, DOWNLOAD_PATH_PREFIX)
+    ).open(url, timeout=timeout)
+
+
 class CfTClient:
     def __init__(
         self,
         *,
-        opener: Callable[..., object] = urllib.request.urlopen,
+        opener: Callable[..., object] = _metadata_open,
         timeout: float = 30.0,
     ) -> None:
         self._opener = opener
@@ -257,7 +295,7 @@ class CfTClient:
             raise DriverMetadataError(f"无法读取官方版本元数据：{exc}") from exc
         try:
             final_url = response.geturl()
-            _check_https_source(final_url, allowed_host=CURRENT_CHROME_PLATFORM_HOST)
+            _check_https_source(final_url, allowed_host=CURRENT_CHROME_PLATFORM_HOST, path_prefix="/chrome-for-testing/")
             payload = response.read()
             return json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -277,13 +315,13 @@ class CfTClient:
             known_versions = metadata["versions"]
         except (KeyError, TypeError) as exc:
             raise DriverMetadataError("官方元数据缺少 versions") from exc
-        major = chrome_version.split(".", 1)[0]
+        build = chrome_version.rsplit(".", 1)[0]
         matches: list[DriverDownloadInfo] = []
         for item in known_versions:
             if not isinstance(item, dict):
                 continue
             version = item.get("version")
-            if not isinstance(version, str) or not version.startswith(f"{major}."):
+            if not isinstance(version, str) or not CHROME_VERSION_RE.fullmatch(version) or version.rsplit(".", 1)[0] != build:
                 continue
             downloads = item.get("downloads") or {}
             candidates = downloads.get("chromedriver") or []
@@ -310,8 +348,7 @@ class CfTClient:
         def _version_key(info: DriverDownloadInfo) -> tuple[int, ...]:
             return tuple(int(part) for part in info.version.split("."))
 
-        matches.sort(key=_version_key)
-        return matches[-1]
+        return max(matches, key=lambda match: (match.version == chrome_version, _version_key(match)))
 
 
 def inspect_binary_platform(path: Path) -> str | None:
@@ -403,7 +440,7 @@ def download_driver_to_staging(
     staging_root: Path,
     operation: DriverOperation,
     progress: Callable[[DownloadProgress], None] | None = None,
-    opener: Callable[..., object] = urllib.request.urlopen,
+    opener: Callable[..., object] = _driver_open,
     timeout: float = 30.0,
     chunk_size: int = 64 * 1024,
 ) -> StagedDriver:
@@ -557,6 +594,7 @@ def validate_staged_driver(
     browser_verifier: Callable[..., object] | None = None,
     chrome_path: str | None = None,
     driver_preparer: Callable[..., object] | None = None,
+    chrome_version: str | None = None,
 ) -> ValidationResult:
     if not staged.path.is_file():
         return ValidationResult(False, None, None, "暂存驱动文件不存在")
@@ -582,6 +620,8 @@ def validate_staged_driver(
             detected_platform,
             f"驱动主版本 {major} 与 Chrome 主版本 {chrome_major} 不匹配",
         )
+    if chrome_version and version.rsplit(".", 1)[0] != chrome_version.rsplit(".", 1)[0]:
+        return ValidationResult(False, version, detected_platform, "驱动与当前 Chrome 构建版本不匹配")
     if driver_preparer is not None:
         try:
             driver_preparer(staged.path, chrome_major=chrome_major)
@@ -644,9 +684,15 @@ def activate_driver(
         path=str(destination / staged.path.name),
         version=staged.version,
         platform=platform_tag,
+        sha256=hashlib.sha256((destination / staged.path.name).read_bytes()).hexdigest(),
     )
     try:
-        store_selection(settings)
+        with operation.commit_lock:
+            _check_operation(operation)
+            store_selection(settings)
+    except DriverOperationCancelled:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
     except Exception as exc:  # noqa: BLE001 - keep old selection
         shutil.rmtree(destination, ignore_errors=True)
         raise DriverActivationError(f"保存有效驱动选择失败：{exc}") from exc
@@ -667,6 +713,13 @@ def check_enabled_driver(
     path = Path(driver_settings.path)
     if not path.is_file():
         return ValidationResult(False, None, None, "已启用驱动文件不存在")
+    if driver_settings.sha256:
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return ValidationResult(False, None, None, "无法读取已启用驱动")
+        if digest != driver_settings.sha256:
+            return ValidationResult(False, None, None, "已启用驱动完整性异常，请重新准备")
     staged = StagedDriver(
         operation_id="installed",
         path=path,
@@ -679,6 +732,8 @@ def check_enabled_driver(
         platform_tag=platform_tag or current_platform_tag(),
         runner=runner,
     )
+    if result.ok and result.version and result.version.rsplit(".", 1)[0] != chrome.version.rsplit(".", 1)[0]:
+        return ValidationResult(False, result.version, result.platform, "驱动与当前 Chrome 构建版本不匹配")
     return result
 
 
@@ -693,7 +748,7 @@ def prepare_automatic_driver(
     browser_verifier: Callable[..., object] | None = None,
     driver_preparer: Callable[..., object] | None = None,
     store_selection: Callable[[object], None],
-    opener: Callable[..., object] = urllib.request.urlopen,
+    opener: Callable[..., object] = _driver_open,
     runner: Callable[..., str] = _run_version,
 ) -> ActivatedDriver:
     client = client or CfTClient()
@@ -717,6 +772,7 @@ def prepare_automatic_driver(
             runner=runner,
             browser_verifier=browser_verifier,
             chrome_path=str(chrome.path),
+            chrome_version=chrome.version,
             driver_preparer=driver_preparer,
         )
         if not result.ok:
@@ -765,6 +821,7 @@ def prepare_manual_driver(
             runner=runner,
             browser_verifier=browser_verifier,
             chrome_path=str(chrome.path),
+            chrome_version=chrome.version,
             driver_preparer=driver_preparer,
         )
         if not result.ok:

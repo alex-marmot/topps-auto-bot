@@ -77,17 +77,14 @@ def test_money_display_parsing() -> None:
     assert detect_currency("EUR 55.00") == "EUR"
 
 
-def test_unverified_profile_refuses_reads_and_actions() -> None:
+def test_default_profile_checks_actual_fields_and_does_not_assume_empty_cart() -> None:
     adapter = SeleniumPageAdapter(EmptyDriver(), DEFAULT_TOPPs_PROFILE, TrustedSourcePolicy())
-    assert DEFAULT_TOPPs_PROFILE.verified is False
-    assert adapter.page_kind() is PageKind.OTHER
+    assert adapter.page_kind() is PageKind.CART
     assert adapter.is_logged_in() is None
     assert adapter.read_login_state().status is LoginStatus.UNRECOGNIZED
-    assert not adapter.login_with_credentials(LoginCredentials("synthetic@example.test", "x")).ok
-    assert adapter.read_cart().status is ReadStatus.UNRECOGNIZED
-    assert adapter.read_checkout().status is ReadStatus.UNRECOGNIZED
+    assert adapter.read_cart().status is ReadStatus.NOT_AVAILABLE
+    assert adapter.read_checkout().status is ReadStatus.NOT_AVAILABLE
     assert adapter.read_product().status is ReadStatus.UNRECOGNIZED
-    assert adapter.search_products("card").status is ReadStatus.UNRECOGNIZED
     assert not adapter.enter_checkout().ok
     assert not adapter.submit_purchase().attempted
 

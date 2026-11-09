@@ -350,7 +350,7 @@ class FakeSession:
             self.page = PageKind.CHECKOUT
         return self.enter_result
 
-    def fill_checkout(self, customer: Customer, card: Card, policy) -> ActionResult:
+    def fill_checkout(self, customer: Customer, card: Card, policy, *, check=lambda: None) -> ActionResult:
         self.fill_calls += 1
         if self.checkout.form is not None:
             self.checkout = replace(
@@ -359,7 +359,8 @@ class FakeSession:
             )
         return ActionResult(True, attempted=True)
 
-    def submit_purchase(self) -> SubmitActionResult:
+    def submit_purchase(self, *, check=lambda: None) -> SubmitActionResult:
+        check()
         self.submit_calls += 1
         if self.on_submit is not None:
             self.on_submit(self)
@@ -476,7 +477,8 @@ class FakeFullSession(FakeSession):
         self.product = replace(self.product, quantity=quantity)
         return ActionResult(True, attempted=True)
 
-    def add_to_cart(self) -> ActionResult:
+    def add_to_cart(self, *, check=lambda: None) -> ActionResult:
+        check()
         self.add_calls += 1
         if self.on_add is not None:
             self.on_add(self)

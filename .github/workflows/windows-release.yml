@@ -1,0 +1,164 @@
+name: Windows Release and Update Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Bootstrap the empty Pages feed, publish a release, or switch Pages to a published release
+        type: choice
+        options: [bootstrap, release, pages]
+        required: true
+      tag:
+        description: Existing tag vX.Y.Z (leave empty for bootstrap)
+        type: string
+      notes:
+        description: Release notes (required for release only)
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: windows-release-and-pages
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      pages_base_url: ${{ steps.pages.outputs.base_url }}
+    steps:
+      - name: Check dispatch and publisher settings
+        env:
+          BRANCH: ${{ github.ref }}
+          PRIVATE: ${{ github.event.repository.private }}
+          OPERATION: ${{ inputs.operation }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+          PUBLISHER_SOURCE: ${{ vars.PUBLISHER_SOURCE }}
+        run: |
+          [[ "$BRANCH" == 'refs/heads/main' ]] || { echo 'Dispatch this workflow from main.'; exit 1; }
+          [[ "$PRIVATE" == 'false' ]] || { echo 'Public Releases and Pages require a publicly accessible distribution repository.'; exit 1; }
+          [[ -n "$PUBLISHER_SOURCE" ]] || { echo 'Set PUBLISHER_SOURCE to the actual Pages latest.json URL.'; exit 1; }
+          if [[ "$OPERATION" == 'bootstrap' ]]; then
+            [[ -z "$RELEASE_TAG" ]] || { echo 'Leave tag empty for bootstrap.'; exit 1; }
+          else
+            [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$ && "$RELEASE_TAG" != 'v0.0.0' ]] || { echo 'Use a version tag vX.Y.Z.'; exit 1; }
+          fi
+          if [[ "$OPERATION" == 'release' ]]; then
+            [[ -n "${RELEASE_NOTES//[[:space:]]/}" && "${#RELEASE_NOTES}" -le 12000 ]] || { echo 'Provide 1–12000 characters of release notes.'; exit 1; }
+          fi
+
+      - uses: actions/configure-pages@v6
+        id: pages
+      - name: Verify fixed source against the configured Pages site
+        env:
+          PUBLISHER_SOURCE: ${{ vars.PUBLISHER_SOURCE }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          [[ "$PAGES_BASE_URL" == https://* && "$PUBLISHER_SOURCE" == "${PAGES_BASE_URL%/}/latest.json" ]] || {
+            echo 'PUBLISHER_SOURCE does not match the configured HTTPS Pages site.'
+            exit 1
+          }
+
+  build:
+    if: inputs.operation == 'release'
+    needs: validate
+    uses: ./.github/workflows/windows-ci.yml
+    permissions:
+      contents: read
+    with:
+      tag: ${{ inputs.tag }}
+      publisher_source: ${{ vars.PUBLISHER_SOURCE }}
+
+  release:
+    if: inputs.operation == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows-x64-installer
+          path: installer
+
+      - name: Publish verified installer and checksum
+        working-directory: installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+          BUILT_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          verify_tag() {
+            local ref kind sha
+            ref="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object | [.type, .sha] | @tsv')"
+            read -r kind sha <<< "$ref"
+            if [[ "$kind" == 'tag' ]]; then
+              ref="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object | [.type, .sha] | @tsv')"
+              read -r kind sha <<< "$ref"
+            fi
+            [[ "$kind" == 'commit' && "$sha" == "$BUILT_COMMIT" ]] || {
+              echo 'The tag does not match the Windows build.'
+              exit 1
+            }
+          }
+          verify_tag
+          file="ToppsAutoBot-Setup-${RELEASE_TAG#v}.exe"
+          [[ -s "$file" && -s "$file.sha256" ]]
+          expected="$(sha256sum "$file")"
+          [[ "$(tr -d '\r' < "$file.sha256")" == "$expected" ]] || { echo 'Installer checksum mismatch.'; exit 1; }
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" "$file" "$file.sha256" --verify-tag --draft \
+            --title "Topps Auto Bot $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          verify_tag
+          gh release edit "$RELEASE_TAG" --draft=false
+
+  prepare-pages:
+    if: inputs.operation == 'bootstrap' || inputs.operation == 'pages'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Verify release and prepare static files
+        env:
+          OPERATION: ${{ inputs.operation }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISHER_SOURCE: ${{ vars.PUBLISHER_SOURCE }}
+          PAGES_BASE_URL: ${{ needs.validate.outputs.pages_base_url }}
+        run: |
+          python scripts/prepare_release_pages.py "$OPERATION" \
+            --source "$PUBLISHER_SOURCE" --base-url "$PAGES_BASE_URL" \
+            --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --output artifacts/pages
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: artifacts/pages
+
+  deploy-pages:
+    needs: prepare-pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/deploy-pages@v5
+        id: deployment

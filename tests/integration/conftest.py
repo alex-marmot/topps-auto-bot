@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import replace
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +10,7 @@ from pathlib import Path
 import pytest
 
 from topps_auto_bot.browser import (
-    DEFAULT_TOPPs_PROFILE,
-    SeleniumPageAdapter,
+    PageProfile,
     TrustedSourcePolicy,
     open_live_session,
 )
@@ -230,7 +228,6 @@ class LocalSite:
   <div data-field="total">$55.00</div>
   {SHIPPING}
   {FORM_FIELDS}
-  <iframe data-payment-frame src="{base}/payment.html"></iframe>
   <button data-action="submit-purchase" onclick="window.location.href='/confirmation.html'">Place order</button>
 </div>""",
             )
@@ -248,7 +245,6 @@ class LocalSite:
   <input name="full_name"><input name="email"><input name="phone"><input name="address1">
   <input name="city"><input name="region"><input name="postal_code"><input name="country">
   <input name="card_number"><input name="expiry"><input name="cvv"><input name="holder_name">
-  <iframe data-payment-frame src="{base}/payment.html"></iframe>
   <button data-action="submit-purchase" onclick="window.location.href='/confirmation.html'">Place order</button>
 </div>""",
             )
@@ -334,7 +330,6 @@ class LocalSite:
   <div data-field="total">${total:.2f}</div>
   {SHIPPING}
   {FORM_FIELDS}
-  <iframe data-payment-frame src="{base}/payment.html"></iframe>
   <button data-action="submit-purchase" onclick="window.location.href='/flow-confirmation.html'">Place order</button>
 </div>""",
             )
@@ -367,7 +362,9 @@ class LocalSite:
   <span data-field="product-variant">Retail Box</span>
 </div>""",
             )
-        if path.startswith("/search"):
+        if path == "/":
+            return self.render("home", '<form action="/" method="get"><input type="search" name="q"></form>')
+        if path.startswith("/?q="):
             return self.render(
                 "search",
                 """<div data-page="search">
@@ -459,11 +456,9 @@ def browser(chromedriver_path: Path, chrome_path: Path, local_site: LocalSite, t
         allowed_payment_origins=frozenset({origin}),
         allow_loopback_http=True,
     )
-    profile = replace(
-        DEFAULT_TOPPs_PROFILE,
+    profile = PageProfile(
         name="local-test",
-        verified=True,
-        search_url_template=origin + "/search?q={query}",
+        home_url=origin + "/",
         cart_url=origin + "/flow-cart.html",
         login_url=origin + "/login.html",
     )

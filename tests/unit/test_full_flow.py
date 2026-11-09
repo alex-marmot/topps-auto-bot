@@ -52,6 +52,7 @@ def run_full(
     preparation_timeout: float = 5.0,
     manual_login_timeout: float = 600.0,
     login_result_timeout: float = 30.0,
+    auto_login: bool = False,
 ):
     snapshot = snapshot or make_snapshot(
         config=make_config(),
@@ -59,7 +60,7 @@ def run_full(
     )
     store = store or RunStateStore(tmp_path / "run-state.json")
     runner = FullFlowRunner(
-        snapshot=snapshot,
+        snapshot=replace(snapshot, auto_login=auto_login),
         session=session,
         store=store,
         clock=clock,
@@ -88,6 +89,8 @@ def test_full_flow_happy_path_from_empty_cart(tmp_path: Path) -> None:
     assert loaded.add_to_cart.state is AddToCartState.CONFIRMED
     assert loaded.purchase is not None
     assert loaded.purchase.state is SubmissionState.SUCCEEDED
+    assert loaded.purchase.deadline_utc is None
+    assert loaded.purchase.submitted_at_utc is not None
     assert not loaded.blocking
 
 
@@ -113,7 +116,7 @@ def test_login_not_confirmed_does_not_add(tmp_path: Path) -> None:
     )
     assert outcome.phase is TaskPhase.MISSED
     assert session.add_calls == 0
-    assert session.login_calls == 1
+    assert session.login_calls == 0
 
 
 def test_login_reuses_matching_session_and_records_timing(tmp_path: Path) -> None:
@@ -130,7 +133,7 @@ def test_login_reuses_matching_session_and_records_timing(tmp_path: Path) -> Non
 def test_login_auto_success_before_full_flow(tmp_path: Path) -> None:
     session = FakeFullSession(cart=empty_cart(), logged_in=False)
     session.on_add = lambda s: setattr(s, "cart", make_cart())
-    outcome, _store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    outcome, _store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path, auto_login=True)
     assert outcome.phase is TaskPhase.SUCCEEDED
     assert session.login_calls == 1
     assert outcome.login_preparation is not None
@@ -157,7 +160,7 @@ def test_login_auto_failure_then_manual_success_without_repeat(tmp_path: Path) -
     session.on_login = fail_auto
     session.on_login_state_read = complete_manual
     session.on_add = lambda s: setattr(s, "cart", make_cart())
-    outcome, _store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    outcome, _store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path, auto_login=True)
     assert outcome.phase is TaskPhase.SUCCEEDED
     assert session.login_calls == 1
     assert outcome.login_preparation is not None
@@ -187,6 +190,7 @@ def test_auto_login_timeout_then_manual_success(tmp_path: Path) -> None:
         clock=FakeClock(),
         tmp_path=tmp_path,
         login_result_timeout=0.5,
+        auto_login=True,
     )
     assert outcome.phase is TaskPhase.SUCCEEDED
     assert session.login_calls == 1
@@ -194,27 +198,15 @@ def test_auto_login_timeout_then_manual_success(tmp_path: Path) -> None:
     assert outcome.login_preparation.mode == "MANUAL"
 
 
-def test_login_wrong_existing_account_waits_for_manual_without_submitting(tmp_path: Path) -> None:
-    session = FakeFullSession(cart=empty_cart(), logged_in=True)
-    session.login_state = LoginRead(
-        status=LoginStatus.LOGGED_IN,
-        account_identity="not" + session.login_credentials.email,
-    )
-
-    def switch_account(s: FakeFullSession) -> None:
-        if s.login_state_reads >= 2:
-            s.login_state = LoginRead(
-                status=LoginStatus.LOGGED_IN,
-                account_identity=s.login_credentials.email,
-            )
-
-    session.on_login_state_read = switch_account
+@pytest.mark.parametrize("identity", [None, "different@example.test"])
+def test_default_reuses_observed_login_without_matching_saved_email(tmp_path, identity):
+    session = FakeFullSession(cart=empty_cart())
+    session.login_state = LoginRead(status=LoginStatus.LOGGED_IN, account_identity=identity)
     session.on_add = lambda s: setattr(s, "cart", make_cart())
-    outcome, _store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    outcome, _ = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
     assert outcome.phase is TaskPhase.SUCCEEDED
     assert session.login_calls == 0
-    assert outcome.login_preparation is not None
-    assert outcome.login_preparation.mode == "MANUAL"
+    assert outcome.login_preparation.mode == "REUSED"
 
 
 def test_login_challenge_goes_manual_without_credentials(tmp_path: Path) -> None:
@@ -245,7 +237,7 @@ def test_manual_login_cancel_does_not_add(tmp_path: Path) -> None:
         s.login_state = LoginRead(status=LoginStatus.NOT_LOGGED_IN, error="invalid credentials")
         cancel.set()
 
-    session.on_login = fail_auto
+    session.on_login_state_read = fail_auto
     outcome, _store = run_full(
         session=session,
         clock=FakeClock(),
@@ -254,7 +246,7 @@ def test_manual_login_cancel_does_not_add(tmp_path: Path) -> None:
     )
     assert outcome.phase is TaskPhase.STOPPED
     assert session.add_calls == 0
-    assert session.login_calls == 1
+    assert session.login_calls == 0
 
 
 def test_manual_login_timeout_does_not_add(tmp_path: Path) -> None:
@@ -271,7 +263,7 @@ def test_manual_login_timeout_does_not_add(tmp_path: Path) -> None:
     )
     assert outcome.phase is TaskPhase.MISSED
     assert session.add_calls == 0
-    assert session.login_calls == 1
+    assert session.login_calls == 0
 
 
 def test_account_change_during_execution_stops_before_add(tmp_path: Path) -> None:
@@ -547,17 +539,96 @@ def test_add_record_save_failure_does_not_click(tmp_path: Path) -> None:
     assert session.add_calls == 0
 
 
-def test_add_confirmed_after_long_runtime_still_checkout(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("elapsed", "phase"), [(29, TaskPhase.SUCCEEDED), (31, TaskPhase.UNKNOWN)])
+def test_add_click_time_counts_toward_result_deadline(tmp_path: Path, elapsed, phase) -> None:
     clock = FakeClock()
     session = FakeFullSession(cart=empty_cart())
-    session.on_add = lambda s: (
-        setattr(s, "cart", make_cart()),
-        clock.advance(700),
-    )
-    outcome, _store = run_full(session=session, clock=clock, tmp_path=tmp_path)
-    assert outcome.phase is TaskPhase.SUCCEEDED
+    session.on_add = lambda s: (setattr(s, "cart", make_cart()), clock.advance(elapsed))
+    outcome, store = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is phase
     assert session.add_calls == 1
+    assert session.submit_calls == (phase is TaskPhase.SUCCEEDED)
+    assert store.load().blocking is (phase is TaskPhase.UNKNOWN)
+
+
+@pytest.mark.parametrize("lines", [(make_line(quantity=1),), (make_line(), make_line(title="Extra"))])
+def test_explicit_rejection_then_empty_then_conflicting_cart_blocks(tmp_path: Path, lines) -> None:
+    session = FakeFullSession(cart=empty_cart(), add_result=ActionResult(
+        False, "temporary rejection", attempted=True, confirmed_no_side_effect=True,
+    ))
+    post_add_reads = iter((empty_cart(), make_cart(lines=lines)))
+    original_read = session.read_cart
+    session.read_cart = lambda: next(post_add_reads, make_cart(lines=lines)) if session.add_calls else original_read()
+    outcome, store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.UNKNOWN
+    assert session.add_calls == 1
+    assert session.submit_calls == 0
+    reopened = RunStateStore(store.path).load()
+    assert reopened.blocking
+    assert reopened.add_to_cart.state is AddToCartState.UNKNOWN
+
+
+@pytest.mark.parametrize("gap", ["total_usd", "final_submit_enabled"])
+def test_checkout_wait_is_bounded(tmp_path: Path, gap) -> None:
+    clock = FakeClock()
+    session = FakeFullSession(cart=empty_cart(), checkout=replace(
+        make_checkout(), **{gap: None if gap == "total_usd" else False},
+    ))
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    started = clock.now()
+
+    def checkout_read(s):
+        # A late successful read must not advance the purchase.
+        if clock.now() >= started + timedelta(seconds=31):
+            s.checkout = make_checkout()
+
+    session.on_checkout_read = checkout_read
+    outcome, _ = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.STOPPED
+    assert session.submit_calls == 0
+
+
+def test_payment_click_time_counts_toward_shared_result_deadline(tmp_path: Path) -> None:
+    clock = FakeClock()
+    session = FakeFullSession(cart=empty_cart())
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    session.on_submit = lambda s: clock.advance(61)
+    outcome, store = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.UNKNOWN
     assert session.submit_calls == 1
+    assert store.load().blocking
+
+
+def test_waiting_over_600_seconds_can_still_checkout(tmp_path: Path) -> None:
+    clock = FakeClock()
+    started = clock.now()
+    session = FakeFullSession(cart=empty_cart(), product=make_product_page(add_to_cart_enabled=False))
+
+    def restock(s):
+        if (clock.now() - started).total_seconds() > 700:
+            s.product = replace(s.product, add_to_cart_enabled=True)
+
+    session.on_product_read = restock
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    outcome, _ = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.SUCCEEDED
+    assert (clock.now() - started).total_seconds() > 700
+    assert session.add_calls == session.submit_calls == 1
+
+
+def test_bank_verification_does_not_reset_payment_deadline(tmp_path: Path) -> None:
+    clock = FakeClock()
+    session = FakeFullSession(cart=empty_cart(), order_results=[
+        OrderResult(status=OrderStatus.VERIFICATION, evidence="银行验证"),
+        OrderResult(status=OrderStatus.CONFIRMED, order_id="LATE", payment_state="paid", lines=(make_line(),)),
+    ])
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    session.on_submit = lambda s: clock.advance(59)
+    outcome, store = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.UNKNOWN
+    assert session.submit_calls == 1
+    assert store.load().blocking
+    assert any(event.message == "银行验证" for event in outcome.events)
 
 
 def test_sold_out_wait_continues_beyond_old_windows_until_stop(tmp_path: Path) -> None:
@@ -663,3 +734,118 @@ def test_stop_before_add_does_not_click(tmp_path: Path) -> None:
     )
     assert outcome.phase is TaskPhase.STOPPED
     assert session.add_calls == 0
+
+
+def test_add_conclusion_write_failure_keeps_durable_block(tmp_path):
+    store = RunStateStore(tmp_path / "run-state.json")
+    original_update = store.update_add_to_cart
+
+    def update(record, *, now):
+        if record.state is AddToCartState.CONFIRMED:
+            raise OSError("injected write failure")
+        return original_update(record, now=now)
+
+    store.update_add_to_cart = update
+    session = FakeFullSession(cart=empty_cart())
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    outcome, _ = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path, store=store)
+    assert outcome.phase is TaskPhase.FAILED
+    assert session.add_calls == 1
+    assert session.submit_calls == 0
+    assert RunStateStore(store.path).load().blocking
+
+
+def test_official_longer_wait_does_not_refresh_or_add_early(tmp_path):
+    clock = FakeClock()
+    start = clock.now()
+    session = FakeFullSession(cart=empty_cart(), product=make_product_page())
+    current_product = session.product
+
+    def read_product(s):
+        elapsed = (clock.now() - start).total_seconds()
+        if elapsed < 44:
+            s.product = replace(current_product, status=ReadStatus.WAITING, retry_after_seconds=45)
+        elif s.product.status is ReadStatus.WAITING:
+            s.product = current_product
+
+    session.on_product_read = read_product
+    session.on_add = lambda s: setattr(s, "cart", make_cart())
+    outcome, _ = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.SUCCEEDED
+    assert (clock.now() - start).total_seconds() >= 44.9
+    assert session.refresh_calls == 0
+    assert session.add_calls == session.submit_calls == 1
+
+
+def test_cart_changes_while_reopened_product_waits_for_stock(tmp_path):
+    clock = FakeClock()
+    started = clock.now()
+    session = FakeFullSession(cart=empty_cart(), product=make_product_page(quantity=2))
+    product = session.product
+
+    def read_product(s):
+        if s.product_opens >= 2 and s.cart_navigations == 2:
+            if (clock.now() - started).total_seconds() < 15:
+                s.product = replace(product, add_to_cart_enabled=False)
+            else:
+                s.cart = make_cart(lines=(make_line(title="External item"),))
+                s.product = product
+
+    session.on_product_read = read_product
+    outcome, store = run_full(session=session, clock=clock, tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.STOPPED
+    assert "已有商品" in outcome.message
+    assert session.cart_navigations == 3
+    assert session.add_calls == session.submit_calls == 0
+    assert store.load().status is RunStateStatus.MISSING
+
+
+@pytest.mark.parametrize("changed_at_final_read", [False, True])
+def test_remaining_single_variant_must_match_target(tmp_path, changed_at_final_read):
+    session = FakeFullSession(cart=empty_cart(), product=make_product_page(quantity=2))
+    retail_only = replace(
+        session.product, variants=("Retail Box",), selected_variant="Retail Box", single_variant=True,
+    )
+    if changed_at_final_read:
+        session.on_product_read = lambda s: (
+            setattr(s, "product", retail_only) if s.product_reads == 3 else None
+        )
+    else:
+        session.product = retail_only
+    outcome, store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.STOPPED
+    assert "规格" in outcome.message
+    assert session.add_calls == session.submit_calls == 0
+    assert store.load().status is RunStateStatus.MISSING
+
+
+def test_repeated_restock_after_returning_to_product_has_bounded_cart_rechecks(tmp_path):
+    session = FakeFullSession(cart=empty_cart(), product=make_product_page(quantity=2))
+    product = session.product
+    visits = set()
+
+    def read_product(s):
+        s.product = replace(
+            product, add_to_cart_enabled=s.product_opens == 1 or s.product_opens in visits,
+        )
+        visits.add(s.product_opens)
+
+    session.on_product_read = read_product
+    outcome, store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.STOPPED
+    assert "多次核对" in outcome.message
+    assert session.product_opens == session.cart_navigations == 4
+    assert session.add_calls == session.submit_calls == 0
+    assert store.load().status is RunStateStatus.MISSING
+
+
+def test_page_without_variant_options_does_not_match_named_variant(tmp_path):
+    session = FakeFullSession(
+        cart=empty_cart(),
+        product=make_product_page(variants=(), selected_variant=None, single_variant=True, quantity=2),
+    )
+    outcome, store = run_full(session=session, clock=FakeClock(), tmp_path=tmp_path)
+    assert outcome.phase is TaskPhase.STOPPED
+    assert "规格" in outcome.message
+    assert session.add_calls == session.submit_calls == 0
+    assert store.load().status is RunStateStatus.MISSING

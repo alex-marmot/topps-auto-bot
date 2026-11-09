@@ -3,17 +3,15 @@ from __future__ import annotations
 import queue
 import shutil
 import threading
-from dataclasses import replace
 from pathlib import Path
 
 from tests.support import make_config, make_preset, make_snapshot
 from topps_auto_bot.browser import (
-    DEFAULT_TOPPs_PROFILE,
-    SeleniumPageAdapter,
+    PageProfile,
     TrustedSourcePolicy,
     open_live_session,
 )
-from topps_auto_bot.driver_setup import inspect_chrome, patch_driver_for_uc
+from topps_auto_bot.driver_setup import current_platform_tag, driver_binary_name, inspect_chrome, patch_driver_for_uc
 from topps_auto_bot.models import ScheduleMode, ScheduleSettings, SubmissionState, TaskPhase
 from topps_auto_bot.runner import FullFlowRunner, SystemClock
 from topps_auto_bot.state import AddToCartState, RunStateStore
@@ -27,7 +25,7 @@ def test_uc_local_full_flow_uses_managed_driver_without_no_sandbox(
 ) -> None:
     site = local_site
     site.reset()
-    driver_copy = tmp_path / "chromedriver"
+    driver_copy = tmp_path / driver_binary_name(current_platform_tag())
     shutil.copy2(chromedriver_path, driver_copy)
     driver_copy.chmod(0o755)
     chrome = inspect_chrome(chrome_path)
@@ -37,11 +35,9 @@ def test_uc_local_full_flow_uses_managed_driver_without_no_sandbox(
         allowed_payment_origins=frozenset({origin}),
         allow_loopback_http=True,
     )
-    profile = replace(
-        DEFAULT_TOPPs_PROFILE,
+    profile = PageProfile(
         name="uc-local-test",
-        verified=True,
-        search_url_template=origin + "/search?q={query}",
+        home_url=origin + "/",
         cart_url=origin + "/flow-cart.html",
         login_url=origin + "/login.html",
     )
@@ -57,6 +53,7 @@ def test_uc_local_full_flow_uses_managed_driver_without_no_sandbox(
         no_sandbox=False,
     )
     try:
+        adapter.navigate(origin + "/")
         assert "--no-sandbox" not in adapter._driver.options.arguments
         preset = make_preset(url=f"{site.base}/flow-product.html")
         config = make_config(presets=(preset,), selected=preset.preset_id, order_limit="70.00")

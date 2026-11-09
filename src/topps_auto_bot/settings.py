@@ -6,7 +6,7 @@ import re
 import secrets
 import sys
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -179,20 +179,14 @@ def validate_schedule(schedule: ScheduleSettings, *, now: datetime | None = None
             raise DomainError("定时开售时间必须晚于当前时间")
 
 
-def validate_single_target(config: AppConfig) -> ProductPreset:
-    if not config.presets:
-        raise DomainError("至少需要一个已确认的购买预设")
+def _validate_preset_selection(config: AppConfig) -> None:
     preset_ids = [preset.preset_id for preset in config.presets]
     if any(not preset_id.strip() for preset_id in preset_ids):
         raise DomainError("预设标识不能为空")
     if len(set(preset_ids)) != len(preset_ids):
         raise DomainError("预设标识不能重复")
-    if config.selected_preset_id is None:
-        raise DomainError("必须选择一个唯一购买目标")
-    selected = [preset for preset in config.presets if preset.preset_id == config.selected_preset_id]
-    if len(selected) != 1:
-        raise DomainError("本次唯一目标不明确或选择了多个目标")
-    return selected[0]
+    if config.selected_preset_id is not None and config.selected_preset_id not in preset_ids:
+        raise DomainError("所选预设不存在")
 
 
 def validate_preset(preset: ProductPreset) -> None:
@@ -229,7 +223,7 @@ def validate_config(
     _validate_login(config.login, required=require_login)
     for preset in config.presets:
         validate_preset(preset)
-    validate_single_target(config)
+    _validate_preset_selection(config)
     duplicates = detect_duplicate_presets(config.presets)
     if duplicates:
         left, right = duplicates[0]
@@ -344,6 +338,7 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
             "version": config.driver.version,
             "platform": config.driver.platform,
             "no_sandbox": config.driver.no_sandbox,
+            "sha256": config.driver.sha256,
         },
         "schedule": schedule,
     }
@@ -414,8 +409,6 @@ def config_from_dict(payload: Mapping[str, Any]) -> AppConfig:
     selected = payload.get("selected_preset_id")
     if selected is not None and not isinstance(selected, str):
         raise DomainError("selected_preset_id 必须是文本或 null")
-    if version >= 2 and "login" not in payload:
-        raise DomainError("配置缺少字段：login")
     login_payload = payload.get("login", {})
     if not isinstance(login_payload, Mapping):
         raise DomainError("login 必须是对象")
@@ -457,6 +450,7 @@ def config_from_dict(payload: Mapping[str, Any]) -> AppConfig:
         version=driver_payload.get("version") if driver_payload.get("version") is None or isinstance(driver_payload.get("version"), str) else None,
         platform=driver_payload.get("platform") if driver_payload.get("platform") is None or isinstance(driver_payload.get("platform"), str) else None,
         no_sandbox=bool(driver_payload.get("no_sandbox", False)),
+        sha256=driver_payload.get("sha256"),
     )
     mode_text = _require_text(schedule_payload, "mode", "抢购模式")
     try:
@@ -498,7 +492,7 @@ Migration = Callable[[dict[str, Any]], dict[str, Any]]
 
 def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(payload)
-    payload["login"] = {"email": "", "password": ""}
+    payload.setdefault("login", {"email": "", "password": ""})
     payload["schema_version"] = 2
     return payload
 
@@ -603,6 +597,28 @@ def _secure_temp_path(target: Path) -> Path:
     return Path(raw_path)
 
 
+def load_driver_selection(path: Path, *, fallback: DriverSettings = DriverSettings()) -> DriverSettings:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return DriverSettings(**payload)
+    except FileNotFoundError:
+        return fallback
+    except (OSError, ValueError, TypeError):
+        return DriverSettings()
+
+
+def save_driver_selection(path: Path, settings: DriverSettings) -> None:
+    temp_path = _secure_temp_path(path)
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(asdict(settings), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def save_config(
     path: Path,
     config: AppConfig,
@@ -611,7 +627,7 @@ def save_config(
     before_replace: Callable[[Path], None] | None = None,
 ) -> None:
     path = Path(path)
-    validate_config(config, now=now, require_login=True)
+    validate_config(config, now=now)
     existing = load_config(path)
     if existing.status in (
         ConfigErrorKind.CORRUPT,

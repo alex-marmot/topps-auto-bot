@@ -53,6 +53,7 @@ _SUBMISSION_KEYS = {
     "prepared_level",
     "planned_start_utc",
     "deadline_utc",
+    "submitted_at_utc",
     "target",
     "order_limit_usd",
     "shipping",
@@ -110,7 +111,7 @@ class SubmissionRecord:
     updated_at_utc: str
     prepared_level: PreparedLevel
     planned_start_utc: str | None
-    deadline_utc: str
+    deadline_utc: str | None
     target_title: str
     target_variant: str
     target_quantity: int
@@ -124,6 +125,7 @@ class SubmissionRecord:
     order_id: str | None = None
     payment_state: str | None = None
     note: str | None = None
+    submitted_at_utc: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +137,7 @@ class SubmissionRecord:
             "prepared_level": str(self.prepared_level),
             "planned_start_utc": self.planned_start_utc,
             "deadline_utc": self.deadline_utc,
+            **({"submitted_at_utc": self.submitted_at_utc} if self.submitted_at_utc else {}),
             "target": {
                 "title": self.target_title,
                 "variant": self.target_variant,
@@ -176,12 +179,20 @@ class SubmissionRecord:
             raise DomainError("提交记录版本不受支持")
         if quantity <= 0:
             raise DomainError("提交记录数量无效")
-        for key in ("task_id", "created_at_utc", "updated_at_utc", "deadline_utc"):
+        for key in ("task_id", "created_at_utc", "updated_at_utc"):
             if not isinstance(payload.get(key), str) or not payload[key]:
                 raise DomainError(f"提交记录字段 {key} 无效")
         planned = payload.get("planned_start_utc")
         if planned is not None and not isinstance(planned, str):
             raise DomainError("提交记录计划时间无效")
+        deadline = payload.get("deadline_utc")
+        if deadline is not None and (not isinstance(deadline, str) or not deadline):
+            raise DomainError("提交记录的旧截止时间无效")
+        submitted = payload.get("submitted_at_utc")
+        if submitted is not None and (not isinstance(submitted, str) or not submitted):
+            raise DomainError("提交记录的动作时间无效")
+        if planned and not deadline:
+            raise DomainError("旧定时提交记录缺少截止时间")
         for key in ("order_limit_usd", "total_usd"):
             parse_usd(payload.get(key))
         parse_usd(target.get("unit_price_limit_usd"))
@@ -202,7 +213,8 @@ class SubmissionRecord:
             updated_at_utc=payload["updated_at_utc"],
             prepared_level=prepared,
             planned_start_utc=planned,
-            deadline_utc=payload["deadline_utc"],
+            deadline_utc=deadline,
+            submitted_at_utc=submitted,
             target_title=target["title"],
             target_variant=target["variant"],
             target_quantity=quantity,
@@ -594,7 +606,7 @@ def build_submission_record(
     order_limit_usd: Decimal,
     prepared_level: PreparedLevel,
     planned_start_utc: datetime | None,
-    deadline_utc: datetime,
+    deadline_utc: datetime | None,
     shipping: ShippingSnapshot,
     total_usd: Decimal,
     now: datetime,
@@ -607,7 +619,7 @@ def build_submission_record(
         updated_at_utc=utc_now_iso(now),
         prepared_level=prepared_level,
         planned_start_utc=planned_start_utc.astimezone(timezone.utc).isoformat() if planned_start_utc else None,
-        deadline_utc=deadline_utc.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        deadline_utc=utc_now_iso(deadline_utc) if deadline_utc else None,
         target_title=preset.title,
         target_variant=preset.variant,
         target_quantity=preset.quantity,

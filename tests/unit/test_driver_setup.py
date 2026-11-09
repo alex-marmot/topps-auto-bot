@@ -96,6 +96,24 @@ def test_detect_chrome_uses_runner_and_candidates(tmp_path: Path) -> None:
     assert detect_chrome(candidates=[tmp_path / "missing"], runner=lambda command: "x") is None
 
 
+def test_windows_chrome_detection_reads_the_selected_executable_version(tmp_path, monkeypatch):
+    from topps_auto_bot import driver_setup
+
+    chrome = tmp_path / "Browser [custom]" / "chrome.exe"
+    chrome.parent.mkdir()
+    chrome.write_bytes(b"synthetic exe")
+    monkeypatch.setattr(driver_setup.platform, "system", lambda: "Windows")
+
+    def version_reader(command, *, env):
+        assert command[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+        assert "-LiteralPath $env:TOPPS_CHROME_VERSION_FILE" in command[4]
+        assert Path(env["TOPPS_CHROME_VERSION_FILE"]) == chrome.resolve()
+        return "167.0.5000.12"
+
+    monkeypatch.setattr(driver_setup, "_run_version", version_reader)
+    assert driver_setup.detect_chrome(candidates=[chrome]).major_version == 167
+
+
 def test_inspect_binary_platform(tmp_path: Path) -> None:
     path = tmp_path / "chromedriver"
     path.write_bytes(macho_binary())
@@ -129,6 +147,22 @@ def test_metadata_matching_and_no_fallback() -> None:
         client.find_compatible(metadata, "157.0.0.0", "mac-arm64")
     with pytest.raises(DriverMetadataError):
         client.find_compatible(metadata, "156.0.8078.80", "win64")
+
+
+def test_matches_exact_patch_first_and_never_other_build():
+    versions = ["167.0.5000.1", "167.0.5000.2", "167.0.5001.1"]
+    metadata = {"versions": [
+        {"version": version, "downloads": {"chromedriver": [{
+            "platform": "win64",
+            "url": f"https://storage.googleapis.com/chrome-for-testing-public/{version}/win64/chromedriver-win64.zip",
+        }]}}
+        for version in versions
+    ]}
+    client = CfTClient()
+    assert client.find_compatible(metadata, "167.0.5000.1", "win64").version == versions[0]
+    assert client.find_compatible(metadata, "167.0.5000.9", "win64").version == versions[1]
+    with pytest.raises(DriverMetadataError):
+        client.find_compatible(metadata, "167.0.5002.1", "win64")
 
 
 def test_metadata_rejects_non_official_url() -> None:

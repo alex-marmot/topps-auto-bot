@@ -9,10 +9,14 @@ import tkinter as tk
 import uuid
 import webbrowser
 from dataclasses import replace
+from functools import partial
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+from . import __version__
+from .updates import UpdateError, check_for_update, packaged_source
 
 from .browser import (
     DEFAULT_TOPPs_PROFILE,
@@ -47,6 +51,7 @@ from .models import (
     PreparedLevel,
     ProductPreset,
     ScheduleMode,
+    SINGLE_PRODUCT_VARIANT,
     ScheduleSettings,
     SubmissionState,
     TargetSnapshot,
@@ -83,13 +88,15 @@ from .settings import (
     CURRENT_SCHEMA_VERSION,
     ConfigErrorKind,
     ConfigSaveError,
-    config_with_driver,
+    load_driver_selection,
+    save_driver_selection,
     default_paths,
     load_config,
     parse_card_expiry,
     replace_invalid_config,
     save_config,
     validate_config,
+    validate_preset,
 )
 
 
@@ -117,16 +124,23 @@ class ToppsAutoBotApp:
         self.paths.ensure_directories()
         self.clock = SystemClock()
         self.events: "queue.Queue[TaskEvent]" = queue.Queue()
+        self.update_events: "queue.Queue" = queue.Queue()
         self.driver_events: "queue.Queue[tuple]" = queue.Queue()
         self.store = RunStateStore(self.paths.run_state)
         self.manager = TaskManager(
             store=self.store,
             events=self.events,
             policy=TrustedSourcePolicy(),
-            runner_factory=FullFlowRunner,
+            runner_factory=partial(FullFlowRunner, allow_product_refresh=True),
         )
         self.loaded = load_config(self.paths.config)
         self.config: AppConfig | None = self.loaded.config
+        self.driver_settings = load_driver_selection(
+            self.paths.drivers / "selection.json",
+            fallback=self.config.driver if self.config else DriverSettings(),
+        )
+        self._session_environment = None
+        self._launch_args: tuple[str, ...] = ()
         self.session: SeleniumPageAdapter | None = None
         self.current_phase = TaskPhase.IDLE
         self.active_window: ActiveWindow | None = None
@@ -198,7 +212,8 @@ class ToppsAutoBotApp:
         self.search_result_var = tk.StringVar()
         self.show_card_var = tk.BooleanVar(value=False)
         self.show_login_var = tk.BooleanVar(value=False)
-        self.no_sandbox_var = tk.BooleanVar(value=config.driver.no_sandbox if config else False)
+        self.auto_login_var = tk.BooleanVar(value=False)
+        self.no_sandbox_var = tk.BooleanVar(value=self.driver_settings.no_sandbox)
         self.search_candidates = {}
 
     def _build_ui(self) -> None:
@@ -215,8 +230,54 @@ class ToppsAutoBotApp:
         self._build_settings_tab()
         self._build_task_tab()
         self._build_driver_tab()
+        about = ttk.Frame(notebook)
+        notebook.add(about, text="关于")
+        ttk.Label(about, text=f"Topps Auto Bot {__version__}").pack(anchor="w", padx=10, pady=8)
+        self.update_button = ttk.Button(about, text="检查更新", command=self._check_updates)
+        self.update_button.pack(anchor="w", padx=10)
+        self.update_status = tk.StringVar()
+        ttk.Label(about, textvariable=self.update_status, wraplength=800).pack(anchor="w", padx=10, pady=8)
+        self.download_button = ttk.Button(about, text="用默认浏览器打开下载入口", state="disabled")
+        self.download_button.pack(anchor="w", padx=10)
         status_bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
         status_bar.pack(fill="x", padx=10, pady=(0, 8))
+
+    def _check_updates(self) -> None:
+        self.update_button.configure(state="disabled")
+        self.download_button.configure(state="disabled", command=lambda: None)
+        self.update_status.set("正在查询发布源…")
+
+        def worker():
+            try:
+                self.update_events.put(check_for_update(packaged_source()))
+            except UpdateError as exc:
+                self.update_events.put(str(exc))
+
+        threading.Thread(target=worker, name="topps-check-update", daemon=True).start()
+
+    def _poll_updates(self) -> None:
+        try:
+            result = self.update_events.get_nowait()
+        except queue.Empty:
+            return
+        self.update_button.configure(state="normal")
+        if isinstance(result, str):
+            self.update_status.set(result)
+        elif result.comparison == 0:
+            self.update_status.set(f"当前版本 {__version__} 已是发布源最新版本")
+        elif result.comparison < 0:
+            self.update_status.set(f"发布源版本 {result.version} 低于当前版本")
+        else:
+            self.update_status.set(f"发现版本 {result.version}\n{result.notes}")
+
+            def download():
+                if self.manager.is_active() or self.driver_operation is not None:
+                    messagebox.showinfo("请先停止", "请结束当前任务及驱动准备，再下载新版安装器。")
+                    return
+                messagebox.showinfo("覆盖安装", "打开下载入口后，请正常退出应用再运行安装器。")
+                webbrowser.open(result.download_url)
+
+            self.download_button.configure(state="normal", command=download)
 
     def _build_settings_tab(self) -> None:
         tab = self.settings_tab
@@ -267,7 +328,7 @@ class ToppsAutoBotApp:
         self.search_combo.pack(side="left", padx=6)
         self.search_combo.bind("<<ComboboxSelected>>", self._apply_search_candidate)
 
-        login_frame = ttk.LabelFrame(tab, text="登录资料（先尝试自动登录，失败或验证码转同会话人工）")
+        login_frame = ttk.LabelFrame(tab, text="可选兼容登录资料（默认在专用 Chrome 中人工登录）")
         login_frame.pack(fill="x", padx=6, pady=4)
         ttk.Label(login_frame, text="登录邮箱").grid(row=0, column=0, sticky="e", padx=4, pady=2)
         ttk.Entry(login_frame, textvariable=self.login_email_var, width=32).grid(
@@ -280,6 +341,9 @@ class ToppsAutoBotApp:
         ttk.Checkbutton(
             login_frame, text="显示/编辑密码", variable=self.show_login_var, command=self._toggle_login
         ).grid(row=0, column=4, sticky="w", padx=8)
+        ttk.Checkbutton(
+            login_frame, text="本次尝试自动登录", variable=self.auto_login_var,
+        ).grid(row=0, column=5, sticky="w", padx=4)
         ttk.Label(
             login_frame,
             text="登录账号与收货邮箱独立；密码按当前用户本地配置明文保存，不是加密。"
@@ -403,6 +467,16 @@ class ToppsAutoBotApp:
         ttk.Button(buttons, text="自动下载匹配驱动", command=self._download_driver).pack(side="left", padx=6)
         ttk.Button(buttons, text="取消下载，改为手动选择", command=self._cancel_driver).pack(side="left")
         ttk.Button(buttons, text="手动选择 chromedriver", command=self._manual_driver).pack(side="left", padx=6)
+        diagnostics = ttk.Frame(info)
+        diagnostics.pack(anchor="w", padx=6)
+        ttk.Button(diagnostics, text="打开专用 Chrome（无需购买资料）", command=self._open_browser).pack(side="left")
+        ttk.Button(diagnostics, text="导出脱敏诊断", command=self._export_diagnostics).pack(side="left", padx=6)
+        ttk.Button(diagnostics, text="Chrome 官网", command=lambda: webbrowser.open(
+            "https://www.google.com/chrome/",
+        )).pack(side="left", padx=6)
+        ttk.Button(diagnostics, text="官方下载驱动", command=lambda: webbrowser.open(
+            "https://googlechromelabs.github.io/chrome-for-testing/",
+        )).pack(side="left", padx=6)
         ttk.Label(info, textvariable=self.progress_var, wraplength=900).pack(anchor="w", padx=6, pady=4)
 
     def _load_into_form(self) -> None:
@@ -465,6 +539,9 @@ class ToppsAutoBotApp:
         self._refresh_preset_tree()
 
     def _session_required(self):
+        if self.manager.is_active():
+            messagebox.showerror("任务运行中", "请先停止并等待任务退出，再使用商品读取或搜索")
+            return None
         if self.session is None:
             messagebox.showerror("浏览器未打开", "请先打开专用 Chrome 会话；工具不会另开匿名会话")
             return None
@@ -502,7 +579,7 @@ class ToppsAutoBotApp:
             self.preset_variant_var.set(candidate.variants[0])
         else:
             self.preset_variant_var.set("")
-        self.status_var.set("已填入候选；请确认具体规格、数量和单价后点击“新增/更新预设”")
+        self.status_var.set("已填入候选。请核对规格、数量和预算，再点击“使用当前输入（不保存）”")
 
     def _read_product_link(self) -> None:
         session = self._session_required()
@@ -514,16 +591,16 @@ class ToppsAutoBotApp:
             messagebox.showerror("读取失败", result.error or "无法读取商品页面")
             return
         self.preset_title_var.set(result.title or "")
+        self.preset_url_var.set(result.url or url)
         if len(result.variants) == 1:
             self.preset_variant_var.set(result.variants[0])
+            self.status_var.set("已读取商品及其规格，请确认本次目标")
         elif result.variants:
             self.preset_variant_var.set("")
-            self.status_var.set("商品有多个规格，请选择一个规格后再保存：" + "、".join(result.variants))
+            self.status_var.set("请输入一个页面规格：" + "、".join(result.variants))
         else:
-            self.preset_variant_var.set("单一商品")
-            self.status_var.set("页面未提供规格选项，已填入“单一商品”；请确认后保存")
-        self.preset_url_var.set(result.url or url)
-        self.status_var.set("已读取商品身份和规格；保存预设不等于已加购或已就绪")
+            self.preset_variant_var.set(SINGLE_PRODUCT_VARIANT)
+            self.status_var.set("页面未提供规格选项，已填入“单一商品”，请确认本次目标")
 
     def _select_preset(self) -> None:
         selection = self.preset_tree.selection()
@@ -546,18 +623,10 @@ class ToppsAutoBotApp:
                 quantity=quantity,
                 unit_price_limit_usd=price,
             )
-        except Exception as exc:  # noqa: BLE001
+            validate_preset(preset)
+        except ValueError as exc:
             messagebox.showerror("目标无效", str(exc))
             return
-        validate_config(
-            replace(
-                self.config or self._build_config_from_form(),
-                presets=(preset,),
-                selected_preset_id=preset.preset_id,
-            ),
-            now=self.clock.now(),
-            require_login=True,
-        )
         self._direct_target = preset
         self._selected_preset_id = None
         self._refresh_preset_tree()
@@ -619,7 +688,7 @@ class ToppsAutoBotApp:
             holder_name=self.card_holder_var.get().strip(),
         )
         driver = replace(
-            self.config.driver if self.config else DriverSettings(),
+            self.driver_settings,
             no_sandbox=bool(self.no_sandbox_var.get()),
         )
         config = AppConfig(
@@ -636,7 +705,7 @@ class ToppsAutoBotApp:
             driver=driver,
             schedule=schedule,
         )
-        validate_config(config, now=self.clock.now(), require_login=True)
+        validate_config(config, now=self.clock.now())
         return config
 
     def _save_settings(self, *, silent: bool = False) -> bool:
@@ -807,46 +876,76 @@ class ToppsAutoBotApp:
             self.readiness_var.set("尚未运行就绪；需要环境、登录、空车和未决检查通过")
         if summary["notice"]:
             self.status_var.set(summary["notice"])
-        if self.session is not None and not DEFAULT_TOPPs_PROFILE.verified:
-            self.status_var.set(
-                "专用浏览器会话已打开；官网页面定位尚未完成第 0 组现场验证，自动推进被阻止"
-            )
 
     def _update_start_button(self) -> None:
         pass
+
+    def _checked_environment(self):
+        if self.driver_operation is not None:
+            messagebox.showerror("驱动准备中", "请等待驱动准备完成")
+            return None
+        try:
+            chrome = inspect_chrome(self.driver_chrome.path) if self.driver_chrome else detect_chrome()
+        except DriverSetupError as exc:
+            messagebox.showerror("Chrome 无法读取", str(exc))
+            return None
+        if chrome is None:
+            messagebox.showerror("未找到 Chrome", "请安装 Chrome，或在驱动页重新检测")
+            return None
+        self.driver_chrome = chrome
+        driver = self.driver_settings
+        if driver.no_sandbox != self.no_sandbox_var.get() or not driver.sha256:
+            messagebox.showerror("驱动需验证", "请在驱动页用当前沙箱设置完成 UC 驱动准备")
+            return None
+        check = check_enabled_driver(driver, chrome=chrome)
+        if not check.ok:
+            messagebox.showerror("驱动未就绪", check.error or "请先在驱动页准备驱动")
+            return None
+        return chrome, driver
 
     def _open_browser(self) -> bool:
         if self.manager.is_active():
             messagebox.showerror("任务运行中", "不能在中途切换浏览器")
             return False
-        if self.config is None:
-            messagebox.showerror("配置未完成", "请先保存完整配置")
+        environment = self._checked_environment()
+        if environment is None:
             return False
-        chrome = self.driver_chrome or detect_chrome()
-        if chrome is None:
-            messagebox.showerror("未找到 Chrome", "请安装 Chrome，或在驱动页重新检测")
-            return False
-        self.driver_chrome = chrome
-        check = check_enabled_driver(self.config.driver, chrome=chrome)
-        if not check.ok:
-            messagebox.showerror("驱动未就绪", check.error or "请先在驱动页准备驱动")
-            return False
+        chrome, driver = environment
         try:
+            if self.session is not None:
+                if self._session_environment == environment:
+                    try:
+                        self.session.current_url()
+                        return True
+                    except Exception:
+                        pass
+                self.session.close()
+                self.session = None
             self.session = open_live_session(
                 chrome_path=str(chrome.path),
-                driver_path=self.config.driver.path or "",
+                driver_path=driver.path or "",
                 profile_dir=self.paths.browser_profile,
                 policy=TrustedSourcePolicy(),
                 profile=DEFAULT_TOPPs_PROFILE,
-                no_sandbox=self.config.driver.no_sandbox,
+                no_sandbox=driver.no_sandbox,
             )
-            self.status_var.set(
-                "专用 Chrome 会话已打开；程序会先复用配置账号会话，否则尝试一次自动登录，失败或验证码时转人工"
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001
+            self._session_environment = environment
+            self._launch_args = self.session.launch_arguments()
+            self.driver_status_var.set("UC 启动通过，Chrome " + chrome.version + "，参数 "
+                                       + " ".join(self._launch_args))
+        except Exception as exc:
             messagebox.showerror("浏览器启动失败", str(exc))
             return False
+        try:
+            self.session.navigate(DEFAULT_TOPPs_PROFILE.home_url)
+            access_error = self.session.public_access_error()
+        except Exception:
+            access_error = "官网首页未能正常加载"
+        self.status_var.set(
+            "实站访问未通过，" + access_error + "。请在专用 Chrome 中核对页面。"
+            if access_error else "专用 Chrome 已打开。请在其中人工登录，已有登录会话可继续使用。"
+        )
+        return True
 
     def _start_task(self) -> None:
         if self.manager.is_active():
@@ -855,16 +954,6 @@ class ToppsAutoBotApp:
         if self.config is None:
             messagebox.showerror("配置未完成", "请先保存完整配置")
             return
-        if not DEFAULT_TOPPs_PROFILE.verified:
-            messagebox.showerror(
-                "官网页面定位未验证",
-                "第 0 组实站验证尚未完成，不能用未验证的页面定位自动推进购买。"
-                "已打开的专用浏览器会话仍可手动使用。",
-            )
-            return
-        if self.session is None:
-            if not self._open_browser():
-                return
         blocked = self.store.load()
         if blocked.blocking:
             messagebox.showerror(
@@ -873,22 +962,13 @@ class ToppsAutoBotApp:
                 + "；请先在官方页面核对，不能直接开始新任务。",
             )
             return
-        chrome = self.driver_chrome or detect_chrome()
-        if chrome is None:
-            messagebox.showerror("未找到 Chrome", "请先准备浏览器")
-            return
-        check = check_enabled_driver(self.config.driver, chrome=chrome)
-        if not check.ok:
-            messagebox.showerror("驱动未就绪", check.error or "请先准备驱动")
-            return
         target = self.config.target_snapshot()
         if self._direct_target is not None:
             target = TargetSnapshot(preset=self._direct_target, order_limit_usd=self.config.order_limit_usd)
         if target is None:
             messagebox.showerror("目标不明确", "请选择预设或点击“使用当前输入（不保存）”")
             return
-        if not self.config.login.email.strip():
-            messagebox.showerror("登录资料缺失", "请先在设置中填写并保存登录邮箱；缺少资料不能开始自动登录")
+        if not self._open_browser():
             return
         snapshot = TaskSnapshot(
             task_id=new_task_id(),
@@ -896,9 +976,10 @@ class ToppsAutoBotApp:
             login=self.config.login,
             customer=self.config.customer,
             card=self.config.card,
-            driver=self.config.driver,
+            driver=self.driver_settings,
             schedule=baseline_schedule(self.config.schedule),
             created_at_utc=self.clock.now(),
+            auto_login=self.auto_login_var.get(),
         )
         result = self.manager.start(snapshot, self.session)
         if not result.ok:
@@ -908,7 +989,7 @@ class ToppsAutoBotApp:
         self.run_ready = False
         self.active_window = None
         self.phase_var.set(phase_label(self.current_phase))
-        self.status_var.set("任务已启动；会先核实配置账号登录，随后持续等待目标可购；可随时 Stop")
+        self.status_var.set("任务已启动。核实专用 Chrome 登录状态后持续等待目标可购，可随时 Stop")
         self._refresh_time_summary()
 
     def _stop_task(self) -> None:
@@ -919,6 +1000,9 @@ class ToppsAutoBotApp:
         self.status_var.set("停止处理中；等待在途浏览器操作按有限超时退出")
 
     def _choose_chrome(self) -> None:
+        if self.manager.is_active() or self.driver_operation is not None:
+            messagebox.showerror("环境使用中", "请先结束当前任务或驱动准备")
+            return
         selected = filedialog.askopenfilename(
             title="选择 Chrome 可执行文件",
             filetypes=[("Chrome", "chrome*"), ("Applications", "*.app"), ("All files", "*")],
@@ -934,6 +1018,9 @@ class ToppsAutoBotApp:
         self.driver_status_var.set(f"Chrome：{chrome.path}（版本 {chrome.version}，{chrome.architecture}）")
 
     def _detect_chrome(self) -> None:
+        if self.manager.is_active() or self.driver_operation is not None:
+            messagebox.showerror("环境使用中", "请先结束当前任务或驱动准备")
+            return
         chrome = detect_chrome()
         self.driver_chrome = chrome
         if chrome is None:
@@ -966,14 +1053,12 @@ class ToppsAutoBotApp:
         def progress(update: DownloadProgress) -> None:
             self.driver_events.put(("progress", update))
 
+        no_sandbox = self.no_sandbox_var.get()
+
         def store_selection(settings) -> None:
-            current = load_config(self.paths.config)
-            if not current.ok:
-                raise DriverValidationError("本地配置不可用，无法保存驱动选择")
-            save_config(
-                self.paths.config,
-                config_with_driver(current.config, settings),
-                now=self.clock.now(),
+            save_driver_selection(
+                self.paths.drivers / "selection.json",
+                replace(settings, no_sandbox=no_sandbox),
             )
 
         def worker() -> None:
@@ -986,7 +1071,7 @@ class ToppsAutoBotApp:
                     platform_tag=current_platform_tag(),
                     progress=progress,
                     browser_verifier=lambda **kwargs: verify_blank_browser(
-                        **kwargs, no_sandbox=self.config.driver.no_sandbox
+                        **kwargs, no_sandbox=no_sandbox
                     ),
                     driver_preparer=patch_driver_for_uc,
                     store_selection=store_selection,
@@ -1021,14 +1106,12 @@ class ToppsAutoBotApp:
         self.driver_operation = operation
         self.progress_var.set("正在复制到私有暂存区并验证…")
 
+        no_sandbox = self.no_sandbox_var.get()
+
         def store_selection(settings) -> None:
-            current = load_config(self.paths.config)
-            if not current.ok:
-                raise DriverValidationError("本地配置不可用，无法保存驱动选择")
-            save_config(
-                self.paths.config,
-                config_with_driver(current.config, settings),
-                now=self.clock.now(),
+            save_driver_selection(
+                self.paths.drivers / "selection.json",
+                replace(settings, no_sandbox=no_sandbox),
             )
 
         def worker() -> None:
@@ -1040,7 +1123,7 @@ class ToppsAutoBotApp:
                     operation=operation,
                     platform_tag=current_platform_tag(),
                     browser_verifier=lambda **kwargs: verify_blank_browser(
-                        **kwargs, no_sandbox=self.config.driver.no_sandbox
+                        **kwargs, no_sandbox=no_sandbox
                     ),
                     driver_preparer=patch_driver_for_uc,
                     store_selection=store_selection,
@@ -1061,6 +1144,7 @@ class ToppsAutoBotApp:
         self.root.after(1000, self._tick_runtime)
 
     def _poll_events(self) -> None:
+        self._poll_updates()
         try:
             while True:
                 event = self.events.get_nowait()
@@ -1113,8 +1197,7 @@ class ToppsAutoBotApp:
                         self.progress_var.set(f"{update.stage}：已下载 {update.downloaded_bytes} 字节（无总长度）")
                 elif kind == "done":
                     self.progress_var.set(f"驱动已启用：{payload.path}（版本 {payload.version}）")
-                    self.loaded = load_config(self.paths.config)
-                    self.config = self.loaded.config
+                    self.driver_settings = load_driver_selection(self.paths.drivers / "selection.json")
                     self.driver_operation = None
                 elif kind == "cancelled":
                     self.progress_var.set(str(payload) + "；未启用该副本，旧驱动选择保持不变")
@@ -1127,9 +1210,6 @@ class ToppsAutoBotApp:
         self.root.after(100, self._poll_events)
 
     def _export_diagnostics(self) -> None:
-        if self.config is None:
-            messagebox.showerror("无法导出", "尚未加载有效配置")
-            return
         target = filedialog.asksaveasfilename(
             title="导出脱敏诊断",
             defaultextension=".json",
@@ -1143,8 +1223,11 @@ class ToppsAutoBotApp:
             state_parts.append(f"add_to_cart:{loaded.add_to_cart.state}")
         if loaded.purchase is not None:
             state_parts.append(f"purchase:{loaded.purchase.state}")
+        redactor = Redactor()
+        if self.config is not None:
+            redactor = Redactor.from_credentials(self.config.customer, self.config.card, self.config.login)
         report = build_diagnostic_report(
-            redactor=Redactor.from_credentials(self.config.customer, self.config.card, self.config.login),
+            redactor=redactor,
             phase=str(self.current_phase),
             events=self._event_log[-300:],
             submission_state=(",".join(state_parts) if state_parts else None),
@@ -1152,8 +1235,10 @@ class ToppsAutoBotApp:
                 "python": sys.version.split()[0],
                 "tk": str(tk.TkVersion),
                 "chrome": self.driver_chrome.version if self.driver_chrome else None,
-                "driver_version": self.config.driver.version,
-                "driver_mode": self.config.driver.mode,
+                "driver_version": self.driver_settings.version,
+                "driver_mode": self.driver_settings.mode,
+                "uc_arguments": self._launch_args,
+                "no_sandbox": self.driver_settings.no_sandbox,
             },
             created_at=self.clock.now(),
         )
@@ -1176,7 +1261,9 @@ class ToppsAutoBotApp:
         )
         timestamp = event.at_utc.astimezone(timezone.utc).strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{timestamp}] {phase_label(event.phase)}：{event.message}\n")
+        account = event.details.get("account_summary")
+        message = f"{event.message}（{account}）" if account else event.message
+        self.log_text.insert("end", f"[{timestamp}] {phase_label(event.phase)}：{message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -1185,7 +1272,14 @@ class ToppsAutoBotApp:
             if not messagebox.askyesno("任务仍在运行", "停止自动操作并关闭程序？未决付款仍需在官方渠道核对。"):
                 return
             self.manager.stop()
-            self.manager.join(timeout=5)
+            self.manager.join(timeout=0.1)
+            if self.manager.is_active():
+                self.status_var.set("正在等待任务正常退出。结束后可关闭程序并覆盖安装。")
+                return
+        if self.driver_operation is not None:
+            self._cancel_driver()
+            self.status_var.set("正在取消驱动准备。退出后可关闭程序并覆盖安装。")
+            return
         if self.session is not None:
             try:
                 self.session.close()

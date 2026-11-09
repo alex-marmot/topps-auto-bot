@@ -18,6 +18,7 @@ FLOW_LEGACY_PREPARED = "legacy_prepared"
 _TOP_KEYS = {"schema_version", "flow_type", "add_to_cart", "add_to_cart_attempts", "purchase", "updated_at_utc"}
 _ADD_KEYS = {"schema_version", "task_id", "state", "created_at_utc", "updated_at_utc", "target", "note", "attempt_seq"}
 _TARGET_KEYS = {"title", "variant", "quantity"}
+_PENDING_ADD_STATES = (AddToCartState.IN_FLIGHT, AddToCartState.UNKNOWN)
 
 
 class RunStateStatus(StrEnum):
@@ -34,6 +35,13 @@ class RunStateBlocked(RuntimeError):
 
 class RunStateStoreError(RuntimeError):
     pass
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise DomainError("运行状态 JSON 包含重复字段")
+    return obj
 
 
 @dataclass(frozen=True)
@@ -73,14 +81,14 @@ class AddToCartRecord:
         if not isinstance(target, Mapping) or set(target) - _TARGET_KEYS:
             raise DomainError("加购记录目标字段无效")
         try:
-            version = int(payload["schema_version"])
             state = AddToCartState(str(payload["state"]))
-            quantity = int(target["quantity"])
         except (KeyError, TypeError, ValueError) as exc:
             raise DomainError("加购记录必要字段无效") from exc
-        if version != RUN_STATE_SCHEMA_VERSION:
+        version = payload.get("schema_version")
+        if type(version) is not int or version != RUN_STATE_SCHEMA_VERSION:
             raise DomainError("加购记录版本不受支持")
-        if quantity <= 0:
+        quantity = target.get("quantity")
+        if type(quantity) is not int or quantity <= 0:
             raise DomainError("加购记录数量无效")
         attempt_seq = payload.get("attempt_seq", 1)
         if isinstance(attempt_seq, bool) or not isinstance(attempt_seq, int) or attempt_seq <= 0:
@@ -125,10 +133,7 @@ class RunStateSnapshot:
             RunStateStatus.IO_ERROR,
         ):
             return True
-        if self.add_to_cart is not None and self.add_to_cart.state in (
-            AddToCartState.IN_FLIGHT,
-            AddToCartState.UNKNOWN,
-        ):
+        if self.add_to_cart is not None and self.add_to_cart.state in _PENDING_ADD_STATES:
             return True
         if self.purchase is not None and self.purchase.state in (
             SubmissionState.SUBMITTING,
@@ -149,16 +154,18 @@ class RunStateStore:
         return self._path
 
     def load(self) -> RunStateSnapshot:
-        if not self._path.exists():
-            return RunStateSnapshot(RunStateStatus.MISSING)
         try:
             text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return RunStateSnapshot(RunStateStatus.MISSING)
+        except UnicodeDecodeError:
+            return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态不是有效 UTF-8")
         except OSError as exc:
             return RunStateSnapshot(RunStateStatus.IO_ERROR, error=str(exc))
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            return RunStateSnapshot(RunStateStatus.CORRUPT, error=f"运行状态不是有效 JSON：{exc.msg}")
+            payload = json.loads(text, object_pairs_hook=_unique_object)
+        except (ValueError, RecursionError) as exc:
+            return RunStateSnapshot(RunStateStatus.CORRUPT, error=f"运行状态不是有效 JSON：{exc}")
         if not isinstance(payload, Mapping):
             return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态根节点必须是对象")
         version = payload.get("schema_version")
@@ -172,7 +179,7 @@ class RunStateStore:
         if version == 1:
             try:
                 purchase = SubmissionRecord.from_dict(payload)
-            except (DomainError, ValueError, TypeError) as exc:
+            except (ValueError, TypeError, OverflowError) as exc:
                 return RunStateSnapshot(
                     RunStateStatus.CORRUPT,
                     error=f"旧购买记录无法读取：{exc}",
@@ -189,39 +196,52 @@ class RunStateStore:
             )
         if set(payload) - _TOP_KEYS:
             return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态包含不允许的字段")
+        if not (_TOP_KEYS - {"add_to_cart_attempts"}) <= payload.keys():
+            return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态缺少必要字段")
+        updated = payload["updated_at_utc"]
+        if not isinstance(updated, str) or not updated:
+            return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态更新时间无效")
         flow_type = payload.get("flow_type")
         if flow_type not in (FLOW_FULL_BASELINE, FLOW_LEGACY_PREPARED):
             return RunStateSnapshot(RunStateStatus.CORRUPT, error="运行状态流程类型无效")
         add_to_cart = None
-        attempts: list[AddToCartRecord] = []
         purchase = None
-        add_payload = payload.get("add_to_cart")
-        attempts_payload = payload.get("add_to_cart_attempts", [])
-        purchase_payload = payload.get("purchase")
+        add_payload = payload["add_to_cart"]
+        purchase_payload = payload["purchase"]
         try:
             if add_payload is not None:
                 if not isinstance(add_payload, Mapping):
                     raise DomainError("加购记录必须是对象或 null")
                 add_to_cart = AddToCartRecord.from_dict(add_payload)
-            if attempts_payload is not None:
-                if not isinstance(attempts_payload, list):
+            if "add_to_cart_attempts" not in payload:
+                # The legacy schema-2 writer stored only the first attempt.
+                if add_to_cart is not None and add_to_cart.attempt_seq != 1:
+                    raise DomainError("多次加购的运行状态缺少尝试历史")
+                attempts = (add_to_cart,) if add_to_cart is not None else ()
+            else:
+                attempts_payload = payload["add_to_cart_attempts"]
+                if not isinstance(attempts_payload, list) or not all(
+                    isinstance(item, Mapping) for item in attempts_payload
+                ):
                     raise DomainError("加购尝试记录必须是数组")
-                attempts = [
-                    AddToCartRecord.from_dict(item)
-                    for item in attempts_payload
-                    if isinstance(item, Mapping)
-                ]
+                attempts = tuple(AddToCartRecord.from_dict(item) for item in attempts_payload)
+                if (attempts[-1] if attempts else None) != add_to_cart:
+                    raise DomainError("当前加购记录与最新尝试不一致")
+                if any(attempt.state in _PENDING_ADD_STATES for attempt in attempts[:-1]):
+                    raise DomainError("加购历史包含未决的旧尝试")
+                if len({(attempt.task_id, attempt.attempt_seq) for attempt in attempts}) != len(attempts):
+                    raise DomainError("加购历史包含重复的尝试序号")
             if purchase_payload is not None:
                 if not isinstance(purchase_payload, Mapping):
                     raise DomainError("购买记录必须是对象或 null")
                 purchase = SubmissionRecord.from_dict(purchase_payload)
-        except (DomainError, ValueError, TypeError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             return RunStateSnapshot(RunStateStatus.CORRUPT, error=str(exc))
         return RunStateSnapshot(
             RunStateStatus.OK,
             flow_type=flow_type,
             add_to_cart=add_to_cart,
-            add_to_cart_attempts=tuple(attempts),
+            add_to_cart_attempts=attempts,
             purchase=purchase,
         )
 
@@ -304,46 +324,35 @@ class RunStateStore:
 
     def begin_add_to_cart(self, record: AddToCartRecord, *, now: datetime) -> None:
         snapshot = self._loaded_ok()
-        attempts = tuple(
-            attempt
+        if any(
+            attempt.task_id == record.task_id and attempt.attempt_seq == record.attempt_seq
             for attempt in snapshot.add_to_cart_attempts
-            if not (
-                attempt.task_id == record.task_id
-                and attempt.attempt_seq == record.attempt_seq
-            )
-        ) + (record,)
+        ):
+            raise RunStateBlocked("加购尝试序号已存在")
         self._write(
             add_to_cart=record,
             purchase=snapshot.purchase,
             flow_type=FLOW_FULL_BASELINE,
             now=now,
-            add_to_cart_attempts=attempts,
+            add_to_cart_attempts=snapshot.add_to_cart_attempts + (record,),
         )
 
     def update_add_to_cart(self, record: AddToCartRecord, *, now: datetime) -> AddToCartRecord:
         snapshot = self.load()
         if snapshot.status is not RunStateStatus.OK:
             raise RunStateStoreError("没有可更新的运行状态")
-        if snapshot.add_to_cart is None or snapshot.add_to_cart.task_id != record.task_id:
-            raise RunStateStoreError("加购记录任务不匹配")
+        current = snapshot.add_to_cart
+        if current is None or (current.task_id, current.attempt_seq) != (record.task_id, record.attempt_seq):
+            raise RunStateStoreError("加购记录任务或尝试序号不匹配")
+        if current.state is not AddToCartState.IN_FLIGHT:
+            raise RunStateStoreError("只能自动更新当前在途加购")
         updated = replace(record, updated_at_utc=utc_now_iso(now))
-        attempts = tuple(
-            updated
-            if attempt.task_id == updated.task_id and attempt.attempt_seq == updated.attempt_seq
-            else attempt
-            for attempt in snapshot.add_to_cart_attempts
-        )
-        if not any(
-            attempt.task_id == updated.task_id and attempt.attempt_seq == updated.attempt_seq
-            for attempt in attempts
-        ):
-            attempts += (updated,)
         self._write(
             add_to_cart=updated,
             purchase=snapshot.purchase,
             flow_type=FLOW_FULL_BASELINE,
             now=now,
-            add_to_cart_attempts=attempts,
+            add_to_cart_attempts=snapshot.add_to_cart_attempts[:-1] + (updated,),
         )
         return updated
 
@@ -387,7 +396,7 @@ class RunStateStore:
         snapshot = self.load()
         if snapshot.status is not RunStateStatus.OK or snapshot.add_to_cart is None:
             raise RunStateStoreError("没有可解除的加购记录")
-        if snapshot.add_to_cart.state not in (AddToCartState.IN_FLIGHT, AddToCartState.UNKNOWN):
+        if snapshot.add_to_cart.state not in _PENDING_ADD_STATES:
             raise RunStateStoreError("加购记录当前未处于阻断状态")
         updated = replace(snapshot.add_to_cart, state=state, note=note, updated_at_utc=utc_now_iso(now))
         attempts = tuple(

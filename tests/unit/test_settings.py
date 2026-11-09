@@ -61,9 +61,10 @@ def test_missing_config_distinct_from_corrupt(tmp_path: Path) -> None:
     assert missing.config is None
 
 
-def test_unselected_or_missing_target_rejected(tmp_path: Path) -> None:
-    with pytest.raises(DomainError):
-        validate_config(make_config(selected=None))
+def test_unselected_settings_have_no_target_and_invalid_selection_is_rejected() -> None:
+    unselected = make_config(selected=None)
+    validate_config(unselected)
+    assert unselected.target_snapshot() is None
     config = make_config()
     payload = config_to_dict(config)
     payload["selected_preset_id"] = "missing"
@@ -171,7 +172,7 @@ def test_controlled_migration_only_with_explicit_rule(tmp_path: Path) -> None:
     assert migrated.config is not None
 
 
-def test_v1_config_migrates_with_login_prompt_and_preserves_trade_data(tmp_path: Path) -> None:
+def test_v1_config_migrates_without_password_and_preserves_trade_data(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     legacy = config_to_dict(make_config())
     legacy["schema_version"] = 1
@@ -183,9 +184,9 @@ def test_v1_config_migrates_with_login_prompt_and_preserves_trade_data(tmp_path:
     assert loaded.config.schema_version == 2
     assert loaded.config.login.email == ""
     assert loaded.config.card == make_config().card
-    with pytest.raises(DomainError):
-        save_config(path, loaded.config)
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 1
+    save_config(path, loaded.config)
+    assert load_config(path).config == loaded.config
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_migration_failure_preserves_original(tmp_path: Path) -> None:
@@ -286,7 +287,7 @@ def test_login_email_requires_valid_address_when_saving(tmp_path: Path) -> None:
     with pytest.raises(DomainError):
         validate_config(make_config(login=make_login(email="not-an-email")), require_login=True)
     with pytest.raises(DomainError):
-        save_config(tmp_path / "config.json", make_config(login=LoginCredentials(email="")))
+        save_config(tmp_path / "config.json", make_config(login=LoginCredentials(email="invalid")))
 
 
 def test_old_invalid_window_does_not_block_new_task(tmp_path: Path) -> None:

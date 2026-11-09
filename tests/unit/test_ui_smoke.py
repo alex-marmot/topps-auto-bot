@@ -89,6 +89,58 @@ def test_ui_first_run_save_and_restart(tmp_path: Path) -> None:
         assert app2.login_password_var.get() == "********"
         assert "尚未运行就绪" in app2.readiness_var.get()
         assert app2._prepared_level is PreparedLevel.NONE
+        assert not app2.auto_login_var.get()
+        app2.login_email_var.set("")
+        app2.show_login_var.set(True)
+        app2._toggle_login()
+        app2.login_password_var.set("")
+        assert app2._save_settings(silent=True)
+        saved = load_config(paths.config).config
+        assert saved.login.email == saved.login.password == ""
+        assert saved.card == loaded.config.card
+        assert saved.presets == loaded.config.presets
+    finally:
+        root.destroy()
+
+
+def test_ui_opens_browser_before_purchase_settings(tmp_path, monkeypatch):
+    from topps_auto_bot import ui
+    from topps_auto_bot.driver_setup import ChromeInstallation, ValidationResult
+    from topps_auto_bot.models import DriverSettings
+
+    root = new_root()
+    paths = AppPaths.under(tmp_path / "data")
+    try:
+        app = ToppsAutoBotApp(root, paths)
+        assert app.config is None
+        assert not app.auto_login_var.get()
+        app.driver_settings = DriverSettings(path="controlled-driver", sha256="checked")
+        chrome = ChromeInstallation(tmp_path / "controlled-chrome", "156.0.8078.80", "mac-arm64")
+        monkeypatch.setattr(ui, "detect_chrome", lambda: chrome)
+        monkeypatch.setattr(ui, "inspect_chrome", lambda path: chrome)
+        monkeypatch.setattr(ui, "check_enabled_driver", lambda *_args, **_kwargs: ValidationResult(True, chrome.version, chrome.architecture))
+
+        class Session:
+            def navigate(self, _url):
+                pass
+
+            def public_access_error(self):
+                return "官网要求人工处理挑战"
+
+            def launch_arguments(self):
+                return ("--disable-blink-features=AutomationControlled",)
+
+        monkeypatch.setattr(ui, "open_live_session", lambda **_kwargs: Session())
+        assert app._open_browser()
+        assert "UC 启动通过" in app.driver_status_var.get()
+        assert "官网要求人工处理挑战" in app.status_var.get()
+        assert not paths.config.exists()
+        messages = []
+        monkeypatch.setattr(ui.messagebox, "showerror", lambda *args: messages.append(args))
+        app.no_sandbox_var.set(True)
+        assert not app._open_browser()
+        assert messages[0][0] == "驱动需验证"
+        assert app.session is not None
     finally:
         root.destroy()
 
@@ -204,9 +256,51 @@ def test_ui_driver_cancel_then_manual_updates_only_after_completion(tmp_path: Pa
 
         monkeypatch.setattr(ui_module, "prepare_manual_driver", fake_manual)
         app._manual_driver()
-        wait_for(lambda: app.config is not None and app.config.driver.mode == "manual")
+        wait_for(lambda: app.driver_settings.mode == "manual")
         assert "驱动已启用" in app.progress_var.get()
         assert app.config is not None
-        assert app.config.driver.mode == "manual"
+        assert app.driver_settings.mode == "manual"
+    finally:
+        root.destroy()
+
+
+@pytest.mark.parametrize("has_saved_preset", [False, True])
+def test_ui_temporary_target_can_save_purchase_details(tmp_path, monkeypatch, has_saved_preset):
+    from topps_auto_bot.settings import save_config
+
+    root = new_root()
+    paths = AppPaths.under(tmp_path / "data")
+    paths.ensure_directories()
+    if has_saved_preset:
+        save_config(paths.config, make_config())
+    monkeypatch.setattr(messagebox, "showerror", lambda title, message: pytest.fail(f"{title}: {message}"))
+    try:
+        app = ToppsAutoBotApp(root, paths)
+        fields = {
+            "name": "Synthetic Tester", "email": "synthetic@example.test", "phone": "555-0100",
+            "address1": "1 Synthetic Test Lane", "city": "Test City", "region": "TS",
+            "postal": "00000", "country": "US", "card_number": "4111111111111111",
+            "card_expiry": "12/2030", "card_cvv": "123", "card_holder": "Synthetic Tester",
+            "order_limit": "70.00",
+            "preset_title": "Synthetic direct", "preset_variant": "Retail Box",
+            "preset_url": "https://www.topps.com/products/synthetic-direct",
+            "preset_quantity": "2", "preset_price": "25.00",
+        }
+        for name, value in fields.items():
+            getattr(app, name + "_var").set(value)
+
+        app._use_editor_target()
+        target = app._direct_target
+        assert target is not None and target.variant == "Retail Box"
+        app.order_limit_var.set("82.00")
+        app.card_expiry_var.set("11/2031")
+        assert app._save_settings(silent=True)
+        loaded = load_config(paths.config).config
+        assert loaded is not None
+        assert loaded.order_limit_usd == Decimal("82.00")
+        assert (loaded.card.expiry_month, loaded.card.expiry_year) == (11, 2031)
+        assert loaded.presets == (make_config().presets if has_saved_preset else ())
+        assert loaded.target_snapshot() is None
+        assert app._direct_target == target
     finally:
         root.destroy()

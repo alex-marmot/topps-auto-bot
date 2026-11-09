@@ -21,9 +21,10 @@
 | Tcl/Tk | 8.6（uv Python 3.14.0 内置） | Tkinter UI | BSD 风格许可；见 Tcl/Tk 官方发行说明 |
 | Selenium | 4.52.0 | 浏览器自动化 | Apache-2.0；https://pypi.org/project/selenium/ |
 | undetected-chromedriver | 3.5.5 | UC 浏览器启动兼容 | GPL-3.0；https://pypi.org/project/undetected-chromedriver/ |
+| setuptools | 84.2.1 | Python 3.14 中为 UC 提供 `distutils.version` | MIT；https://pypi.org/project/setuptools/ |
 | pytest | 8.4.2 | 测试 | MIT；https://pypi.org/project/pytest/ |
 | PyInstaller | 6.17.0 | Windows 打包 | GPL-2.0-or-later，含 bootloader exception；https://pyinstaller.org/ |
-| Inno Setup | 6.x（Windows 构建时确认实际版本） | Windows 用户级安装器 | Inno Setup 官方许可（可免费分发；以构建时官方许可文本为准）；https://jrsoftware.org/isinfo.php |
+| Inno Setup | 6.3+（Windows 构建时确认实际版本） | Windows 用户级安装器 | Inno Setup 官方许可（可免费分发；以构建时官方许可文本为准）；https://jrsoftware.org/isinfo.php |
 | Google Chrome / ChromeDriver | 开发验证为 156.0.8078.80 | 浏览器与驱动 | Google Chrome for Testing 官方元数据与下载；https://googlechromelabs.github.io/chrome-for-testing/ |
 | uv | 开发工具 | 虚拟环境与依赖锁定 | MIT/Apache-2.0；不进入运行分发包 |
 
@@ -43,3 +44,9 @@
 - 配置样例 `config.example.json` 由本项目编写，仅含空值/占位值，不包含真实个人或支付资料。
 - 研究阶段只读观察过公开页面脚本和参考项目提交；没有把公开脚本中的内部动作当作可直接重放的接口。
 - 真实官网验证、Windows 构建和实际付款验收仍以 `docs/validation.md` 中记录的完成状态为准。
+
+## 本阶段页面规则依据
+
+- 店面使用 Topps 商品页公开的加购按钮、首页搜索表单和官方空车文案作为定位依据。登录入口与 Fanatics ONE 来源按公开页面和既有只读浏览器观察限定。[Topps 空车页](https://www.topps.com/checkout/cart) · [账号自助说明](https://www.topps.com/support/account-self-service)
+- Topps 支持说明描述 Shopify 相关的信用卡结算与 Shop Pay。结算适配包含 Shopify 风格的字段和托管卡 iframe 规则。此关联用于实现和受控验证，当前没有该商户已登录结算 DOM 的实测证据。[Topps 支付选项](https://www.topps.com/support/payment-options) · [Shopify 托管字段来源](https://community.shopify.com/t/how-to-change-checkout-credit-card-text-color-on-debut-theme/51027) · [Shopify 付款及银行验证文档](https://shopify.dev/docs/apps/build/payments/processing)
+- 安装器使用 Inno Setup 互斥量与安装前检查，覆盖安装和回退以 Windows 演练为准。[Inno Setup 安装互斥量](https://jrsoftware.org/ishelp/topic_setup_setupmutex.htm)

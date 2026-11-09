@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 BEIJING_TZ = timezone(timedelta(hours=8))
 UTC = timezone.utc
 USD = "USD"
+SINGLE_PRODUCT_VARIANT = "单一商品"
 
 DEFAULT_WINDOW_SECONDS = 60
 MIN_WINDOW_SECONDS = 1
@@ -159,6 +160,8 @@ class LoginStatus(StrEnum):
 
 
 class ReadStatus(StrEnum):
+    CHALLENGE = "CHALLENGE"
+    WAITING = "WAITING"
     OK = "OK"
     EMPTY = "EMPTY"
     NOT_LOGGED_IN = "NOT_LOGGED_IN"
@@ -179,6 +182,7 @@ class PageKind(StrEnum):
 
 
 class OrderStatus(StrEnum):
+    VERIFICATION = "VERIFICATION"
     CONFIRMED = "CONFIRMED"
     DECLINED = "DECLINED"
     PENDING = "PENDING"
@@ -263,6 +267,7 @@ class DriverSettings:
     version: str | None = None
     platform: str | None = None
     no_sandbox: bool = False
+    sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -325,6 +330,7 @@ class TaskSnapshot:
     driver: DriverSettings
     schedule: ScheduleSettings
     created_at_utc: datetime
+    auto_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -363,6 +369,8 @@ class ProductPageState:
     add_to_cart_enabled: bool = False
     single_variant: bool = False
     error: str | None = None
+    sold_out: bool | None = None
+    retry_after_seconds: int | None = None
 
 
 @dataclass(frozen=True)

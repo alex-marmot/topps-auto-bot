@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -8,14 +10,33 @@ from pathlib import Path
 
 import pytest
 
-from tests.support import make_config, make_preset, shipping_snapshot
-from topps_auto_bot.models import AddToCartState, PreparedLevel, SubmissionState, UTC
+from tests.support import (
+    FakeClock,
+    FakeFullSession,
+    make_cart,
+    make_config,
+    make_preset,
+    make_snapshot,
+    shipping_snapshot,
+)
+from topps_auto_bot.browser import TrustedSourcePolicy
+from topps_auto_bot.models import (
+    AddToCartState,
+    PreparedLevel,
+    ScheduleMode,
+    ScheduleSettings,
+    SubmissionState,
+    TaskPhase,
+    UTC,
+)
 from topps_auto_bot.purchase import build_submission_record
+from topps_auto_bot.runner import FullFlowRunner
 from topps_auto_bot.state import (
     AddToCartRecord,
     RunStateBlocked,
     RunStateStatus,
     RunStateStore,
+    RunStateStoreError,
     build_add_to_cart_record,
 )
 
@@ -47,6 +68,21 @@ def purchase_record(now: datetime | None = None):
         shipping=shipping_snapshot(),
         total_usd=Decimal("55.00"),
         now=now,
+    )
+
+
+def make_runner(store: RunStateStore, session: FakeFullSession, clock: FakeClock) -> FullFlowRunner:
+    return FullFlowRunner(
+        snapshot=make_snapshot(
+            config=make_config(),
+            schedule=ScheduleSettings(mode=ScheduleMode.IMMEDIATE, window_seconds=60),
+        ),
+        session=session,
+        store=store,
+        clock=clock,
+        events=queue.Queue(),
+        cancel_event=threading.Event(),
+        policy=TrustedSourcePolicy(),
     )
 
 
@@ -176,3 +212,148 @@ def test_add_attempts_are_journaled_with_independent_sequences(tmp_path: Path) -
         AddToCartState.CONFIRMED,
     ]
     assert not loaded.blocking
+
+
+def test_pending_history_without_current_record_blocks_reloaded_runner(tmp_path: Path) -> None:
+    path = tmp_path / "run-state.json"
+    clock = FakeClock()
+    RunStateStore(path).begin_add_to_cart(add_record(task_id="old"), now=clock.now())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["add_to_cart"]
+    damaged = json.dumps(payload)
+    path.write_text(damaged, encoding="utf-8")
+
+    store = RunStateStore(path)
+    session = FakeFullSession()
+    outcome = make_runner(store, session, clock).run()
+
+    assert outcome.phase is TaskPhase.BLOCKED
+    assert session.add_calls == session.submit_calls == 0
+    assert store.load().status is RunStateStatus.CORRUPT
+    with pytest.raises(RunStateBlocked):
+        store.begin_add_to_cart(add_record(task_id="new"), now=clock.now())
+    assert path.read_text(encoding="utf-8") == damaged
+
+
+def test_payment_update_preserves_journal_damaged_during_submission(tmp_path: Path) -> None:
+    path = tmp_path / "run-state.json"
+    store = RunStateStore(path)
+    clock = FakeClock()
+    session = FakeFullSession()
+    session.on_add = lambda browser: setattr(browser, "cart", make_cart())
+    damaged = '{"schema_version": 2,'
+
+    def damage_state(_session) -> None:
+        path.write_text(damaged, encoding="utf-8")
+
+    session.on_submit = damage_state
+    outcome = make_runner(store, session, clock).run()
+
+    assert outcome.phase is TaskPhase.FAILED
+    assert session.submit_calls == 1
+    assert path.read_text(encoding="utf-8") == damaged
+    next_session = FakeFullSession()
+    assert make_runner(RunStateStore(path), next_session, clock).run().phase is TaskPhase.BLOCKED
+    assert next_session.add_calls == next_session.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing-purchase", "null-history", "empty-history", "invalid-entry", "duplicate", "mismatch", "older-pending"],
+)
+def test_damaged_journal_blocks_without_rewriting(tmp_path: Path, damage: str) -> None:
+    path = tmp_path / "run-state.json"
+    now = FakeClock().now()
+    store = RunStateStore(path)
+    record = add_record()
+    store.begin_add_to_cart(record, now=now)
+    store.update_add_to_cart(replace(record, state=AddToCartState.CONFIRMED), now=now)
+    if damage == "missing-purchase":
+        store.begin_purchase(purchase_record(now), now=now)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    history = payload["add_to_cart_attempts"]
+    if damage == "missing-purchase":
+        del payload["purchase"]
+    elif damage == "null-history":
+        payload["add_to_cart_attempts"] = None
+    elif damage == "empty-history":
+        history.clear()
+    elif damage == "invalid-entry":
+        history.insert(0, None)
+    elif damage == "duplicate":
+        history.insert(0, history[-1])
+    elif damage == "mismatch":
+        history[-1]["state"] = AddToCartState.UNKNOWN
+    elif damage == "older-pending":
+        history.insert(0, add_record(task_id="old").to_dict())
+    damaged = json.dumps(payload)
+    path.write_text(damaged, encoding="utf-8")
+
+    loaded = RunStateStore(path).load()
+    assert loaded.status is RunStateStatus.CORRUPT
+    assert loaded.blocking
+    with pytest.raises(RunStateBlocked):
+        store.begin_add_to_cart(add_record(task_id="new"), now=now)
+    assert path.read_text(encoding="utf-8") == damaged
+
+
+@pytest.mark.parametrize("damaged", [b'{"schema_version": 2, "schema_version": 2}', b"\xff"])
+def test_duplicate_json_fields_and_invalid_encoding_are_corrupt(tmp_path: Path, damaged: bytes) -> None:
+    path = tmp_path / "run-state.json"
+    path.write_bytes(damaged)
+    loaded = RunStateStore(path).load()
+    assert loaded.status is RunStateStatus.CORRUPT
+    assert loaded.blocking
+    assert path.read_bytes() == damaged
+
+
+def test_legacy_current_add_without_history_or_sequence_remains_resolvable(tmp_path: Path) -> None:
+    path = tmp_path / "run-state.json"
+    now = FakeClock().now()
+    RunStateStore(path).begin_add_to_cart(add_record(), now=now)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["add_to_cart_attempts"]
+    del payload["add_to_cart"]["attempt_seq"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = RunStateStore(path)
+    loaded = store.load()
+    assert loaded.status is RunStateStatus.OK
+    assert loaded.blocking
+    assert loaded.add_to_cart is not None
+    assert loaded.add_to_cart.attempt_seq == 1
+    resolved = store.resolve_add_to_cart(state=AddToCartState.NOT_SENT, note="用户已核对", now=now)
+    reloaded = RunStateStore(path).load()
+    assert reloaded.status is RunStateStatus.OK
+    assert not reloaded.blocking
+    assert reloaded.add_to_cart_attempts == (resolved,)
+
+
+def test_old_attempt_update_cannot_overwrite_current_pending_attempt(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path / "run-state.json")
+    now = FakeClock().now()
+    first = add_record(attempt_seq=1)
+    store.begin_add_to_cart(first, now=now)
+    first = store.update_add_to_cart(replace(first, state=AddToCartState.NOT_SENT), now=now)
+    second = add_record(attempt_seq=2)
+    store.begin_add_to_cart(second, now=now)
+
+    with pytest.raises(RunStateStoreError):
+        store.update_add_to_cart(first, now=now)
+
+    reloaded = RunStateStore(store.path).load()
+    assert reloaded.status is RunStateStatus.OK
+    assert reloaded.blocking
+    assert reloaded.add_to_cart == second
+
+
+def test_only_manual_resolution_can_release_unknown_add(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path / "run-state.json")
+    now = FakeClock().now()
+    record = add_record()
+    store.begin_add_to_cart(record, now=now)
+    store.update_add_to_cart(replace(record, state=AddToCartState.UNKNOWN), now=now)
+
+    with pytest.raises(RunStateStoreError):
+        store.update_add_to_cart(replace(record, state=AddToCartState.NOT_SENT), now=now)
+    assert RunStateStore(store.path).load().blocking

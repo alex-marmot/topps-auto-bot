@@ -1,0 +1,163 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build
+        required: true
+        type: string
+      publisher_source:
+        required: true
+        type: string
+    outputs:
+      commit:
+        value: ${{ jobs.windows.outputs.commit }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: ${{ inputs.tag == '' }}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          architecture: x64
+
+      - name: Verify source and install locked dependencies
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISHER_SOURCE: ${{ inputs.publisher_source }}
+        run: |
+          New-Item -ItemType Directory -Force artifacts/diagnostics | Out-Null
+          $env:PYTHONPATH = "$PWD/src"
+          python -c "import os, platform, sys, tkinter, tomllib; from topps_auto_bot import __version__; from topps_auto_bot.updates import _version; tag=os.environ.get('RELEASE_TAG',''); assert sys.version_info[:2] == (3, 14) and platform.machine() == 'AMD64'; assert __version__ == tomllib.load(open('pyproject.toml', 'rb'))['project']['version']; _version(__version__); assert not tag or (tag == 'v' + __version__ and os.environ['PUBLISHER_SOURCE']); print('Python', sys.version.split()[0], 'Tk', tkinter.Tcl().eval('info patchlevel'), 'app', __version__)" | Tee-Object -FilePath artifacts/diagnostics/environment.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.txt -r requirements-build.txt | Tee-Object -FilePath artifacts/diagnostics/dependencies.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -m pip check
+
+      - name: Prepare ChromeDriver and OpenSSL
+        id: driver
+        run: |
+          $driverCache = Join-Path $env:RUNNER_TEMP 'topps-test-driver'
+          & .\.venv\Scripts\python.exe scripts/fetch_test_driver.py --cache-dir $driverCache 2>&1 | Tee-Object -FilePath artifacts/diagnostics/chromedriver.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $driver = Join-Path $driverCache 'win64-chromedriver.exe'
+          if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) { throw 'ChromeDriver x64 is missing' }
+          "TOPPS_TEST_CHROMEDRIVER=$driver" >> $env:GITHUB_ENV
+          if (-not (Get-Command openssl.exe -ErrorAction SilentlyContinue)) {
+            $gitTools = Join-Path $env:ProgramFiles 'Git/usr/bin'
+            if (-not (Test-Path (Join-Path $gitTools 'openssl.exe'))) { throw 'OpenSSL is missing' }
+            $gitTools >> $env:GITHUB_PATH
+          }
+
+      - name: Run unit and browser tests
+        id: tests
+        run: |
+          & .\.venv\Scripts\python.exe scripts/ci_test_report.py artifacts/diagnostics/tests.json
+
+      - name: Install Inno Setup 6.7.4
+        id: inno
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
+          $compiler = Join-Path $env:RUNNER_TEMP 'topps-inno'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $setup
+          $signature = Get-AuthenticodeSignature -LiteralPath $setup
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)CN=Pyrsys B\.V\.(?:,|$)') {
+            throw 'Inno Setup installer publisher signature is invalid'
+          }
+          $arguments = "/ALLUSERS /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$compiler`""
+          $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $compiler 'ISCC.exe'))) {
+            throw "Inno Setup installation failed (exit $($process.ExitCode))"
+          }
+          $compiler >> $env:GITHUB_PATH
+
+      - name: Build and verify Windows installer
+        id: build
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISHER_SOURCE: ${{ inputs.publisher_source }}
+        run: |
+          $options = @{}
+          if ($env:RELEASE_TAG) {
+            $options = @{ Release = $true; PublisherSource = $env:PUBLISHER_SOURCE }
+          }
+          & ./scripts/build_windows.ps1 @options 2>&1 | Tee-Object -FilePath artifacts/diagnostics/build.log
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-installer
+          path: |
+            installer-output/ToppsAutoBot-Setup-*.exe
+            installer-output/ToppsAutoBot-Setup-*.exe.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+      - name: Record stage outcomes
+        if: always()
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          DRIVER_OUTCOME: ${{ steps.driver.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          INNO_OUTCOME: ${{ steps.inno.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          New-Item -ItemType Directory -Force artifacts/diagnostics | Out-Null
+          $summary = @(
+            "Source and dependencies: $env:SOURCE_OUTCOME"
+            "ChromeDriver preparation: $env:DRIVER_OUTCOME"
+            "Tests: $env:TEST_OUTCOME"
+            "Inno Setup: $env:INNO_OUTCOME"
+            "Build: $env:BUILD_OUTCOME"
+          )
+          $summary | Set-Content artifacts/diagnostics/stages.txt
+          $summary | ForEach-Object { "- $_" } >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path artifacts/diagnostics/tests.json) {
+            $counts = (Get-Content artifacts/diagnostics/tests.json -Raw | ConvertFrom-Json).counts
+            "- Passed: $($counts.passed); failed: $($counts.failed); skipped: $($counts.skipped)" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-diagnostics
+          path: artifacts/diagnostics/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14

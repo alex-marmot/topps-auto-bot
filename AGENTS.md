@@ -8,9 +8,7 @@
 
 ## Current State
 
-当前已有可运行的本地应用、依赖锁文件、单元/集成测试、文档和 Windows 构建定义。Windows 安装验收尚未完成；真实登录/付款未验收只作为试用状态，不再是开发完成条件。现有 `DEFAULT_TOPPs_PROFILE.verified=False` 全局启动阻断须按新规范移除，但当前代码尚未完成该修改。受控结果不得写成现网购买成功。
-
-当前代码已有此前的登录、空车、商品到付款基线；最近审查仍发现跨iframe填卡、加购部分结果阻断和步骤期限缺口，本轮须作为待办，不得用209项旧测试覆盖结论代替修复，并加入 UC 启动适配、无整单截止、尝试序号记录和普通控件 JS 兜底；旧的整单窗口路径测试保留为历史证据。UC 依赖已加入锁定文件，macOS 上用暂存副本重新签名后已通过 UC 空白启动和本地受控全流程；普通 Selenium 仅作诊断。真实 Topps 页面、Windows 和真实付款仍未验收。登录资料保存在本地配置，密码默认遮蔽但非加密；验证码不持久化。
+当前实现默认在专用浏览器人工登录，支持复用有效会话及显式选择兼容自动登录。页面推进依据当前步骤的字段、来源、订单和会话检查。多 iframe 填卡、加购结果核对、单次付款及主动更新均有受控测试。Windows x64 安装、覆盖升级与回退仍待验收，发布源待配置。真实账号登录和付款属于可选试用，详见 `docs/validation.md`。
 
 主要规划入口：`openspec/changes/phase-0-topps-website-bot/`。当前阶段要求与技术决策分别以该变更的 specs 和 design 为准。主规格在完成归档后落入 `openspec/specs/`。验证状态见 `docs/validation.md`。
 
@@ -79,6 +77,8 @@ uv pip install --python .venv/bin/python -e .
 .venv/bin/python scripts/fetch_test_driver.py
 .venv/bin/python -m topps_auto_bot --data-dir /tmp/topps-auto-bot-dev
 ```
+
+Windows x64 构建在安装 CPython 3.14/Tk 和 Inno Setup 6.3+ 后，从本目录运行 `powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1`。发布构建另需 `-Release -PublisherSource $PublisherSource`，详情见 `docs/development.md`。
 
 Windows 使用 `.venv\Scripts\python.exe`。macOS 上 uv Python 3.14.0 自带 Tk 8.6；Homebrew Python 3.14.7 可能缺少 `_tkinter`，不能据此判断 Windows Tk 不可用。
 
