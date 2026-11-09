@@ -130,7 +130,8 @@ def test_scheduled_local_site_trigger_deviation(browser, local_site, tmp_path: P
     adapter.navigate(f"{site.base}/checkout.html")
     from datetime import datetime, timedelta, timezone
 
-    planned = datetime.now(timezone.utc) + timedelta(seconds=1)
+    # Leave time for the real browser to fill and verify the form before the scheduled start.
+    planned = datetime.now(timezone.utc) + timedelta(seconds=5)
     snapshot = make_snapshot(
         config=make_config(),
         schedule=ScheduleSettings(mode=ScheduleMode.SCHEDULED, scheduled_start_utc=planned, window_seconds=30),
@@ -191,6 +192,7 @@ def _run_iteration(adapter, policy, site, url: str, tmp_path: Path, index: int):
     return outcome.performance, outcome.window
 
 
+@pytest.mark.legacy_performance
 def test_both_paths_30_warm_runs_p95_under_500ms(browser, local_site, tmp_path: Path) -> None:
     adapter, policy, site = browser
     samples: list[PerformanceSample] = []

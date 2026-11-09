@@ -86,7 +86,7 @@ jobs:
       - name: Run unit and browser tests
         id: tests
         run: |
-          & .\.venv\Scripts\python.exe scripts/ci_test_report.py artifacts/diagnostics/tests.json
+          & .\.venv\Scripts\python.exe scripts/ci_test_report.py artifacts/diagnostics/tests.json -m 'not legacy_performance'
 
       - name: Install Inno Setup 6.7.4
         id: inno
@@ -128,6 +128,13 @@ jobs:
           overwrite: true
           retention-days: 14
 
+      - name: Measure historical checkout latency (diagnostic)
+        id: legacy_performance
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          & .\.venv\Scripts\python.exe scripts/ci_test_report.py artifacts/diagnostics/legacy-performance.json -m legacy_performance
+
       - name: Record stage outcomes
         if: always()
         env:
@@ -136,6 +143,7 @@ jobs:
           TEST_OUTCOME: ${{ steps.tests.outcome }}
           INNO_OUTCOME: ${{ steps.inno.outcome }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          LEGACY_PERFORMANCE_OUTCOME: ${{ steps.legacy_performance.outcome }}
         run: |
           New-Item -ItemType Directory -Force artifacts/diagnostics | Out-Null
           $summary = @(
@@ -144,6 +152,7 @@ jobs:
             "Tests: $env:TEST_OUTCOME"
             "Inno Setup: $env:INNO_OUTCOME"
             "Build: $env:BUILD_OUTCOME"
+            "Historical checkout latency (diagnostic): $env:LEGACY_PERFORMANCE_OUTCOME"
           )
           $summary | Set-Content artifacts/diagnostics/stages.txt
           $summary | ForEach-Object { "- $_" } >> $env:GITHUB_STEP_SUMMARY

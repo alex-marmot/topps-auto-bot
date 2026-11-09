@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from collections import Counter
 from pathlib import Path
 
@@ -27,14 +27,18 @@ class Results:
             self.outcomes[report.nodeid] = report.outcome
 
 
-def main(path: Path) -> int:
+def main(path: Path, *, markers: str = "") -> int:
     results = Results()
-    status = pytest.main(["-q", "-ra", "tests/unit", "tests/integration"], plugins=[results])
+    arguments = ["-q", "-ra", "--tb=short", "tests/unit", "tests/integration"]
+    if markers:
+        arguments.extend(["-m", markers])
+    status = pytest.main(arguments, plugins=[results])
     totals = Counter(results.outcomes.values())
     counts = {key: totals[key] for key in ("passed", "failed", "skipped")}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "pytest_exit_code": int(status),
+        "marker_expression": markers,
         "counts": counts,
         "tests": [
             {"test": nodeid.split("[", 1)[0], "outcome": outcome}
@@ -48,4 +52,8 @@ def main(path: Path) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(Path(sys.argv[1])))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path", type=Path)
+    parser.add_argument("-m", "--markers", default="")
+    args = parser.parse_args()
+    raise SystemExit(main(args.path, markers=args.markers))

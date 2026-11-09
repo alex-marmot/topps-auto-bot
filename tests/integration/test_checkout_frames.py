@@ -508,9 +508,12 @@ def test_managed_visible_uc_cross_frame_flow(chromedriver_path, chrome_path, tmp
         chrome_path=str(chrome.path), driver_path=str(activated.path),
         profile_dir=tmp_path / "sandbox-diagnostic", policy=policy, no_sandbox=True,
     )
+    driver_process = diagnostic._driver.service.process
     try:
         assert "--no-sandbox" in diagnostic.launch_arguments()
     finally:
         diagnostic.close()
+        # UC initiates termination without waiting for Windows to release the executable.
+        driver_process.wait(timeout=10)
     activated.path.write_bytes(contents + b"tamper")
     assert not check_enabled_driver(settings, chrome=chrome).ok

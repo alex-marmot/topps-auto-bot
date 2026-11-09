@@ -35,7 +35,8 @@ def test_publisher_versions_and_request_contains_no_local_data(version, comparis
 
 
 @pytest.mark.parametrize("payload", [
-    b"invalid json", b"null", b"{}", b" " * (64 * 1024 + 1),
+    b"invalid json", b"null", b"{}",
+    pytest.param(b" " * (64 * 1024 + 1), id="oversized-response"),
     b'{"version":"next","notes":"Release","download_url":"https://publisher.example.test/download"}',
     b'{"version":"1.0.0","notes":false,"download_url":"https://publisher.example.test/download"}',
     b'{"version":"1.0.0","notes":"Release","download_url":"https://other.example.test/download"}',

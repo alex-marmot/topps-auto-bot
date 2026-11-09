@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import stat
 import zipfile
 from pathlib import Path
@@ -280,7 +281,9 @@ def test_manual_staging_copies_without_modifying_source(tmp_path: Path) -> None:
     )
     assert tmp_path / "staging" / "manual-1" in staged.path.parents
     assert source.read_bytes() == original
-    assert staged.path.stat().st_mode & stat.S_IXUSR
+    assert staged.path.read_bytes() == original
+    if os.name != "nt":
+        assert staged.path.stat().st_mode & stat.S_IXUSR
     assert staged.path != source
 
 
