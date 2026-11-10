@@ -43,10 +43,10 @@ def main() -> int:
             if any(part in {"browser-profile", "drivers", "driver-staging", "logs", "screenshots"} for part in Path(path).parts):
                 problems.append(f"用户数据目录被跟踪：{path}")
 
-    dist = ROOT / "dist" / "ToppsAutoBot"
-    if dist.exists():
-        forbidden_names = {"config.json", "run-state.json", "browser-profile", "drivers", "driver-staging", "logs", "screenshots"}
-        for path in dist.rglob("*"):
+    packages = (ROOT / "dist" / "ToppsAutoBot", ROOT / "dist" / "macos-arm64" / "ToppsAutoBot.app")
+    forbidden_names = {"config.json", "run-state.json", "browser-profile", "drivers", "driver-staging", "logs", "screenshots"}
+    for package in packages:
+        for path in package.rglob("*"):
             if path.name in forbidden_names:
                 problems.append(f"构建产物包含禁止项：{path.relative_to(ROOT)}")
 

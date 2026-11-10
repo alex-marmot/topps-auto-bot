@@ -1,6 +1,12 @@
-# Windows 安装与驱动维护
+# 安装与驱动维护
 
-## 安装前准备
+## macOS Apple Silicon 试用包
+
+在 Apple Silicon Mac 上解压 `ToppsAutoBot-<版本>-macos-arm64.zip`，打开其中的 `ToppsAutoBot.app`。使用前安装 Google Chrome，并在应用的“驱动”页准备匹配的 ChromeDriver。应用内含 Python 和 Tcl/Tk。
+
+试用包使用 ad-hoc 签名，尚未经过 Apple 公证。在其他 Mac 上下载并打开时，Gatekeeper 可能会拦截。
+
+## Windows 安装前准备
 
 - Windows 10/11 x64。
 - 已安装 Google Chrome（推荐使用官方稳定版）。不需要另外安装 Python、开发工具或命令行组件。

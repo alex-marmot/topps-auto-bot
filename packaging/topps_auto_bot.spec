@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parent
@@ -64,3 +66,12 @@ coll = COLLECT(
     upx_exclude=[],
     name="ToppsAutoBot",
 )
+
+if sys.platform == "darwin":
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    app = BUNDLE(
+        coll,
+        name="ToppsAutoBot.app",
+        bundle_identifier="io.github.alex-marmot.topps-auto-bot",
+        version=version,
+    )

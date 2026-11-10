@@ -128,6 +128,17 @@ GitHub 托管 runner 有管理员权限和预装工具。其测试和冻结程�
 
 重新生成锁文件时，对 `requirements.in`、`requirements-dev.in` 和 `requirements-build.in` 使用 `uv pip compile --universal --python-version 3.14 --generate-hashes`。UC 3.5.5 从 `distutils.version` 导入 `LooseVersion`，Python 3.14 通过已锁定的 setuptools 提供该兼容模块。PyInstaller 收集定义须保留这一运行依赖。
 
+## macOS Apple Silicon 试用包
+
+在 Apple Silicon Mac 上用 uv 准备带 Tcl/Tk 的 CPython 3.14 arm64 虚拟环境，再执行以下命令。如果仓库已有可用的 `.venv`，直接执行打包命令。
+
+```sh
+uv venv --python 3.14.0 .venv
+bash scripts/build_macos.sh
+```
+
+脚本使用 `requirements-build.txt` 校验依赖哈希，通过共享 PyInstaller 配置生成应用，验证签名完整性、冻结运行时、版本和发布卫生。应用、ZIP 和 SHA-256 文件在 `dist/macos-arm64/`。试用包使用临时签名（ad-hoc）。面向普通用户分发的 Developer ID 签名与 Apple 公证需要单独配置。
+
 ## 代码边界
 
 - UI 只处理表单与展示；后台线程通过队列向 UI 发送状态，不直接调用 Tk 控件。
